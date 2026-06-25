@@ -24,13 +24,18 @@ const RELEASE_BASE_URL: &str = "https://github.com/Smech-Labs/SmechDeploy/releas
 // userland-install can fetch any package name, known or not, and let the
 // HTTP request itself fail if it doesn't exist.
 //
-// NOTE: base-system is deliberately not listed here. It's corrupted in the
-// spk-repo-gun git history itself (its xz stream ends prematurely -- this
-// is independent of the GerritHub API truncation bug) and needs to be
-// rebuilt from source before it can be republished. `spk system-install
-// base-system` will still attempt the fetch and fail clearly rather than
-// pretend the package doesn't exist.
+// base-system was rebuilt from source against musl+Clang (see
+// bin/10_bootstrap_musl.sh, bin/11_bootstrap_userland_musl.sh,
+// bin/12_write_etc_skeleton.py) after the old copy turned out to be
+// corrupted in the spk-repo-gun git history. It's the GNU userland
+// (coreutils, grep, sed, tar, gzip, xz, findutils, diffutils, gawk, make,
+// file) compiled against musl instead of glibc, with every optional
+// host-only library dependency (SELinux, OpenSSL, GMP, libcap, ACLs,
+// PCRE, zlib/bzlib/zstdlib/libseccomp) explicitly disabled at configure
+// time and every binary individually verified to actually execute, not
+// just compile.
 const KNOWN_PACKAGES: &[&str] = &[
+    "base-system",
     "kernel-modules",
     "firmware",
     "bootloader-grub",
