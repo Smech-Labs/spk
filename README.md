@@ -51,15 +51,20 @@ Packages are fetched from a GitHub Release on
 https://github.com/Smech-Labs/SmechDeploy/releases/download/v1.0.0-packages/<package>.tar.xz
 ```
 
-Currently published: `kernel-modules`, `firmware`, `bootloader-grub`,
-`kde-frameworks`, `plasma`, `qt6`, `mesa-graphics`, `calamares-installer`.
+Currently published: `base-system`, `kernel-modules`, `firmware`,
+`bootloader-grub`, `kde-frameworks`, `plasma`, `qt6`, `mesa-graphics`,
+`calamares-installer`.
 
-**`base-system` is not currently published.** It's corrupted in the
-`spk-repo-gun` git history itself (its `xz` stream ends prematurely --
-confirmed with `xz -t`), independent of any hosting issue. It needs to be
-rebuilt from source before it can be republished. `spk system-install
-base-system` will attempt the fetch and fail clearly rather than silently
-pretend the package doesn't exist.
+`base-system` was rebuilt from source against musl+Clang after the
+original copy turned out to be corrupted in the `spk-repo-gun` git history
+itself (its `xz` stream ended prematurely). See
+[Smech-Labs/SmechDeploy](https://github.com/Smech-Labs/SmechDeploy)'s
+`bin/10_bootstrap_musl.sh`, `bin/11_bootstrap_userland_musl.sh`, and
+`bin/12_write_etc_skeleton.py` for the actual build process -- every
+binary in the rebuilt package was individually verified to execute
+correctly (not just compile), with every optional host-only library
+dependency (SELinux, OpenSSL, GMP, libcap, ACLs, PCRE, zlib/bzlib/
+zstdlib/libseccomp) explicitly disabled at configure time.
 
 ## Architecture history
 
