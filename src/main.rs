@@ -101,22 +101,25 @@ fn print_help() {
 
 fn print_about() {
     print_banner();
-    println!("{BOLD}--- SMECH-SOVEREIGN WORKSTATION 2026 BUILD ---{R}");
-    println!("  {CYAN}CPU:{R}             AMD Threadripper PRO 9965WX (Zen 5, 24-core, 48-thread)");
-    println!("  {CYAN}Motherboard:{R}     ASUS Pro WS WRX90E-SAGE SE SSI-EEB");
-    println!("  {CYAN}ECC Memory:{R}      256GB DDR5 RDIMM (8x 32GB Kingston FURY Renegade Pro)");
-    println!("  {CYAN}GPUs:{R}            2x NVIDIA RTX 5080 (Horizontal active liquid cooled)");
-    println!("  {CYAN}Storage Tier:{R}    Dual 1TB Samsung 990 PRO NVMe (SmechOS Boot/System)");
-    println!("  {CYAN}Cooling Loop:{R}    Industrial Syltherm 800 -- 4x D5 Pumps, EPDM Tubing");
-    println!("  {CYAN}Power:{R}           Dual ROG Thor III 1200W (2400W total, fully isolated)");
+    println!("{BOLD}SPK -- Smech Sovereign Package Keeper{R}");
+    println!("  Version:    {VERSION}");
+    println!("  License:    MIT");
+    println!("  Homepage:   {CYAN}{DOCS_URL}/smechos.html#spk{R}");
+    println!("  Source:     {CYAN}https://github.com/Smech-Labs/spk{R}");
     println!();
-    println!("{BOLD}--- SPK v{VERSION} ---{R}");
-    println!("  Unified sovereign package keeper for all Smech Labs OSes.");
+    println!("{BOLD}Developed by{R}");
+    println!("  Smech Labs -- https://labs.smech.xyz");
+    println!("  Lead:  Stefan Andrei Ionut");
+    println!("  Co-dev: Gemini (Google DeepMind)");
+    println!("  Co-dev: Claude (Anthropic)");
+    println!("  First release: 2026");
+    println!();
+    println!("{BOLD}About{R}");
+    println!("  Unified sovereign package keeper for SmechOS and SmechVisor.");
     println!("  Zero external crate dependencies -- pure Rust std.");
-    println!("  PackageKit D-Bus backend: enables Plasma Discover integration.");
-    println!("  Native build orchestration via spk compile (wraps spk-compile.py).");
-    println!("  Packages: {RELEASE_BASE_URL}");
-    println!("  Docs:     {CYAN}{DOCS_URL}{R}");
+    println!("  PackageKit backend included: works with Plasma Discover and");
+    println!("  any other PackageKit-aware frontend out of the box.");
+    println!("  Build orchestration via spk-compile (Project SmechDeployV2).");
     println!();
 }
 
@@ -580,7 +583,7 @@ fn main() {
 
         "version" | "--version" | "-v" => println!("spk {VERSION}"),
 
-        "about" | "--about" => print_about(),
+        "about" => print_about(),
 
         "install" => {
             if args.len() < 3 {
