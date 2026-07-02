@@ -109,7 +109,7 @@ fn print_about() {
     println!();
     println!("{BOLD}Developed by{R}");
     println!("  Smech Labs -- https://labs.smech.xyz");
-    println!("  Lead:  Stefan Andrei Ionut");
+    println!("  Lead:  Smech");
     println!("  Co-dev: Gemini (Google DeepMind)");
     println!("  Co-dev: Claude (Anthropic)");
     println!("  First release: 2026");
