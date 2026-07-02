@@ -16,7 +16,7 @@ const RED: &str = "\x1b[31m";
 const MAGENTA: &str = "\x1b[35m";
 
 // ── Config ────────────────────────────────────────────────────────────────────
-const VERSION: &str = "2.0.0";
+const VERSION: &str = "2.0.1";
 const RELEASE_BASE_URL: &str =
     "https://github.com/Smech-Labs/SmechDeploy/releases/download/v1.0.0-packages";
 const DOCS_URL: &str = "https://docs.smech.xyz";
