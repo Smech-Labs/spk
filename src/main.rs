@@ -1,10 +1,13 @@
 use std::env;
 use std::fs;
+use std::io::{BufRead, BufReader, Read, Write as IoWrite};
+use std::net::{TcpListener, UdpSocket};
 use std::path::Path;
 use std::process::{Command, Stdio, exit};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-// Color escape codes
-const RESET: &str = "\x1b[0m";
+// ── ANSI ─────────────────────────────────────────────────────────────────────
+const R: &str = "\x1b[0m";
 const BOLD: &str = "\x1b[1m";
 const GREEN: &str = "\x1b[32m";
 const CYAN: &str = "\x1b[36m";
@@ -12,29 +15,20 @@ const YELLOW: &str = "\x1b[33m";
 const RED: &str = "\x1b[31m";
 const MAGENTA: &str = "\x1b[35m";
 
-// Packages are served from a GitHub Release rather than GerritHub's REST
-// file-content API. That API works for small files but silently truncates
-// large binaries (confirmed: base-system.tar.xz fetches incomplete through
-// it while smaller packages don't) -- GitHub Releases serves raw files
-// directly with no such limit.
-const RELEASE_BASE_URL: &str = "https://github.com/Smech-Labs/SmechDeploy/releases/download/v1.0.0-packages";
+// ── Config ────────────────────────────────────────────────────────────────────
+const VERSION: &str = "2.0.0";
+const RELEASE_BASE_URL: &str =
+    "https://github.com/Smech-Labs/SmechDeploy/releases/download/v1.0.0-packages";
+const DOCS_URL: &str = "https://docs.smech.xyz";
 
-// Packages currently published in the release above. Used by
-// entire-system-upgrade to know what to re-fetch; system-install/
-// userland-install can fetch any package name, known or not, and let the
-// HTTP request itself fail if it doesn't exist.
+// Packages currently published in the release above. Used by system-upgrade to
+// know what to re-fetch; install can fetch any package name (unknown ones just
+// produce an HTTP 404 from curl).
 //
-// base-system was rebuilt from source against musl+Clang (see
-// bin/10_bootstrap_musl.sh, bin/11_bootstrap_userland_musl.sh,
-// bin/12_write_etc_skeleton.py) after the old copy turned out to be
-// corrupted in the spk-repo-gun git history. It's the GNU userland
-// (coreutils, grep, sed, tar, gzip, xz, findutils, diffutils, gawk, make,
-// file) compiled against musl instead of glibc, with every optional
-// host-only library dependency (SELinux, OpenSSL, GMP, libcap, ACLs,
-// PCRE, zlib/bzlib/zstdlib/libseccomp) explicitly disabled at configure
-// time and every binary individually verified to actually execute, not
-// just compile.
-const KNOWN_PACKAGES: &[&str] = &[
+// Packages are served from a GitHub Release rather than a REST file-content
+// API. GitHub Releases serves raw files with no size limit; the GerritHub REST
+// API was silently truncating large .tar.xz files.
+const SMECHOS_PACKAGES: &[&str] = &[
     "base-system",
     "kernel-modules",
     "firmware",
@@ -43,250 +37,596 @@ const KNOWN_PACKAGES: &[&str] = &[
     "plasma",
     "qt6",
     "mesa-graphics",
-    "calamares-installer",
+    "plasma-discover",
+    "packagekit-spk",
 ];
 
+const SMECHVISOR_PACKAGES: &[(&str, bool)] = &[
+    ("smechvisor-daemon", false), // live-swappable, no reboot needed
+    ("smechvisor-base", true),    // kernel/base: requires reboot
+];
+
+// Deploy shim wire protocol
+const SHIM_UDP_PORT: u16 = 9191;
+const SHIM_TCP_PORT: u16 = 9192;
+const BROADCAST_MAGIC: &str = "SMECHVISOR_SHIM";
+
+// ── Banner / help ─────────────────────────────────────────────────────────────
+
 fn print_banner() {
-    println!(
-        "{}{}{}========================================================================{}",
-        BOLD, MAGENTA, RESET, RESET
-    );
-    println!(
-        "{}{}     ███████╗██████╗ ██╗  ██╗    ███████╗ ██████╗ ██╗  ██╗{}",
-        BOLD, RED, RESET
-    );
-    println!(
-        "{}{}     ██╔════╝██╔══██╗██║ ██╔╝    ██╔════╝██╔═══██╗██║ ██╔╝{}",
-        BOLD, RED, RESET
-    );
-    println!(
-        "{}{}     ███████╗██████╔╝█████╔╝     ███████╗██║   ██║█████╔╝ {}",
-        BOLD, RED, RESET
-    );
-    println!(
-        "{}{}     ╚════██║██╔═══╝ ██╔═██╗     ╚════██║██║   ██║██╔═██╗ {}",
-        BOLD, RED, RESET
-    );
-    println!(
-        "{}{}     ███████║██║     ██║  ██╗    ███████║╚██████╔╝██║  ██╗{}",
-        BOLD, RED, RESET
-    );
-    println!(
-        "{}{}               SMECHOS SOVEREIGN PACKAGE KEEPER (SPK){}",
-        BOLD, CYAN, RESET
-    );
-    println!(
-        "{}{}{}========================================================================{}",
-        BOLD, MAGENTA, RESET, RESET
-    );
+    println!("{BOLD}{MAGENTA}========================================================================{R}");
+    println!("{BOLD}{RED}     ███████╗██████╗ ██╗  ██╗    ███████╗ ██████╗ ██╗  ██╗{R}");
+    println!("{BOLD}{RED}     ██╔════╝██╔══██╗██║ ██╔╝    ██╔════╝██╔═══██╗██║ ██╔╝{R}");
+    println!("{BOLD}{RED}     ███████╗██████╔╝█████╔╝     ███████╗██║   ██║█████╔╝ {R}");
+    println!("{BOLD}{RED}     ╚════██║██╔═══╝ ██╔═██╗     ╚════██║██║   ██║██╔═██╗ {R}");
+    println!("{BOLD}{RED}     ███████║██║     ██║  ██╗    ███████║╚██████╔╝██║  ██╗{R}");
+    println!("{BOLD}{CYAN}          SMECH SOVEREIGN PACKAGE KEEPER  v{VERSION}{R}");
+    println!("{BOLD}{MAGENTA}========================================================================{R}");
 }
 
 fn print_help() {
     print_banner();
-    println!("{}USAGE:{}", BOLD, RESET);
-    println!("    spk <COMMAND> [package]");
+    println!("{BOLD}USAGE:{R}  spk <COMMAND> [args...]");
     println!();
-    println!("{}COMMANDS:{}", BOLD, RESET);
-    println!(
-        "    {}system-install <pkg>{}   Fetch and install a package onto the target system partition",
-        GREEN, RESET
-    );
-    println!(
-        "    {}userland-install <pkg>{} Fetch and install a userland package",
-        GREEN, RESET
-    );
-    println!(
-        "    {}entire-system-upgrade{}  Re-fetch and reinstall every known SmechOS package",
-        GREEN, RESET
-    );
-    println!("    {}about{}                  Show SmechOS workstation specs and software credits", GREEN, RESET);
-    println!("    {}help{}                   Show this help menu", GREEN, RESET);
+    println!("{BOLD}PACKAGE MANAGEMENT{R}");
+    println!("    {GREEN}install <pkg>{R}              Fetch and install a package");
+    println!("    {GREEN}system-upgrade{R}             Re-fetch and reinstall all known packages");
     println!();
-    println!("{}EXAMPLES:{}", BOLD, RESET);
-    println!("    spk system-install base-system");
-    println!("    spk userland-install plasma");
-    println!("    spk entire-system-upgrade");
+    println!("{BOLD}BUILD (native orchestration via spk-compile.py){R}");
+    println!("    {GREEN}compile smechos{R}            Full SmechOS build");
+    println!("    {GREEN}compile smechvisor{R}         Full SmechVisor build");
+    println!("    {GREEN}compile smechos  --phase <p>{R}  Single SmechOS phase");
+    println!("    {GREEN}compile smechvisor --phase <p>{R} Single SmechVisor phase");
+    println!("    {GREEN}compile iso smechos{R}        SmechOS install ISO");
+    println!("    {GREEN}compile iso smechvisor{R}     SmechVisor install ISO");
+    println!("    {GREEN}compile iso shim{R}           SmechVisor deploy shim ISO");
+    println!("    {GREEN}compile --list smechos{R}     List SmechOS build phases");
+    println!("    {GREEN}compile --list smechvisor{R}  List SmechVisor build phases");
+    println!();
+    println!("{BOLD}SMECHVISOR NETWORK DEPLOY{R}");
+    println!("    {GREEN}deploy-system-img-copy <code>{R}  Push SmechVisor to a shim node");
+    println!("    {GREEN}receive-deploy{R}                 Receive a SmechVisor deploy (shim mode)");
+    println!();
+    println!("{BOLD}PACKAGEKIT BACKEND (called by PackageKit daemon -- not for manual use){R}");
+    println!("    {GREEN}packagekit-backend{R}         Speak PackageKit script protocol on stdin/stdout");
+    println!();
+    println!("{BOLD}OTHER{R}");
+    println!("    {GREEN}version{R}                    Print version");
+    println!("    {GREEN}about{R}                      Workstation specs + credits");
+    println!("    {GREEN}help{R}                       This help");
+    println!();
+    println!("  Docs: {CYAN}{DOCS_URL}{R}");
     println!();
 }
 
 fn print_about() {
     print_banner();
-    println!("{}--- SMECH-SOVEREIGN WORKSTATION 2026 build CONFIGURATION ---{}", BOLD, RESET);
-    println!("  {}CPU:{}             AMD Threadripper PRO 9965WX (Zen 5, 24-core, 48-thread)", CYAN, RESET);
-    println!("  {}Motherboard:{}     ASUS Pro WS WRX90E-SAGE SE SSI-EEB", CYAN, RESET);
-    println!("  {}ECC Memory:{}     256GB DDR5 RDIMM (8x 32GB Kingston FURY Renegade Pro)", CYAN, RESET);
-    println!("  {}GPUs:{}           2x NVIDIA RTX 5080 (Horizontal active liquid cooled)", CYAN, RESET);
-    println!("  {}Storage Tier:{}    Dual 1TB Samsung 990 PRO NVMe RAID (SmechOS Boot/System)", CYAN, RESET);
-    println!("  {}Cooling Loop:{}    Industrial Active Syltherm 800 - 4x D5 Pumps, EPDM Tubing", CYAN, RESET);
-    println!("  {}Power Res:{}      Dual ROG Thor III 1200W (Total 2400W fully isolated)", CYAN, RESET);
+    println!("{BOLD}--- SMECH-SOVEREIGN WORKSTATION 2026 BUILD ---{R}");
+    println!("  {CYAN}CPU:{R}             AMD Threadripper PRO 9965WX (Zen 5, 24-core, 48-thread)");
+    println!("  {CYAN}Motherboard:{R}     ASUS Pro WS WRX90E-SAGE SE SSI-EEB");
+    println!("  {CYAN}ECC Memory:{R}      256GB DDR5 RDIMM (8x 32GB Kingston FURY Renegade Pro)");
+    println!("  {CYAN}GPUs:{R}            2x NVIDIA RTX 5080 (Horizontal active liquid cooled)");
+    println!("  {CYAN}Storage Tier:{R}    Dual 1TB Samsung 990 PRO NVMe (SmechOS Boot/System)");
+    println!("  {CYAN}Cooling Loop:{R}    Industrial Syltherm 800 -- 4x D5 Pumps, EPDM Tubing");
+    println!("  {CYAN}Power:{R}           Dual ROG Thor III 1200W (2400W total, fully isolated)");
     println!();
-    println!("{}--- SPK ARCHITECTURE CREDITS ---{}", BOLD, RESET);
-    println!("  Designed by Gemini / Antigravity with Comrade Smech.");
-    println!("  Built as a zero-dependency, static sovereign manager.");
-    println!("  Fetches real packages from Smech-Labs/SmechDeploy releases -- no Gentoo/Portage,");
-    println!("  no Flatpak, nothing borrowed from another distro's package format.");
+    println!("{BOLD}--- SPK v{VERSION} ---{R}");
+    println!("  Unified sovereign package keeper for all Smech Labs OSes.");
+    println!("  Zero external crate dependencies -- pure Rust std.");
+    println!("  PackageKit D-Bus backend: enables Plasma Discover integration.");
+    println!("  Native build orchestration via spk compile (wraps spk-compile.py).");
+    println!("  Packages: {RELEASE_BASE_URL}");
+    println!("  Docs:     {CYAN}{DOCS_URL}{R}");
     println!();
 }
 
-fn get_target_context() -> (bool, &'static str) {
-    // Check if we are running on host with /mnt/smechos mounted
-    if Path::new("/mnt/smechos").exists() {
-        (true, "/mnt/smechos")
-    } else {
-        (false, "")
-    }
-}
+// ── Utilities ─────────────────────────────────────────────────────────────────
 
 fn is_root() -> bool {
-    if let Ok(uid_str) = env::var("UID") {
-        uid_str == "0"
+    Command::new("id")
+        .arg("-u")
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim() == "0")
+        .unwrap_or(false)
+}
+
+fn target_root() -> &'static str {
+    if Path::new("/mnt/smechos").exists() {
+        "/mnt/smechos"
     } else {
-        // Fallback using id -u
-        if let Ok(output) = Command::new("id").arg("-u").output() {
-            let s = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            s == "0"
-        } else {
-            false
-        }
+        "/"
     }
 }
 
-/// Fetches a package's .tar.xz from the SmechDeploy GitHub Release and
-/// extracts it into target_root. Shells out to curl/tar (system tools)
-/// rather than pulling in an HTTP/TLS crate, keeping spk a zero-crate-
-/// dependency binary -- consistent with how it already shells out to
-/// chroot/sudo rather than linking against their internals.
-fn fetch_and_install_package(pkg: &str, target_root: &str) -> bool {
-    let url = format!("{}/{}.tar.xz", RELEASE_BASE_URL, pkg);
+fn is_smechvisor() -> bool {
+    Path::new("/usr/bin/smechvisord").exists()
+        || Path::new("/etc/smechvisor-release").exists()
+}
 
-    println!("{}[+] Fetching {}...{}", CYAN, pkg, RESET);
+// ── Package install ───────────────────────────────────────────────────────────
 
-    let tmp_tar = format!("/tmp/spk-{}.tar.xz", pkg);
+fn fetch_and_install(pkg: &str, root: &str) -> bool {
+    let url = format!("{RELEASE_BASE_URL}/{pkg}.tar.xz");
+    let tmp = format!("/tmp/spk-{pkg}.tar.xz");
 
-    let curl_status = Command::new("curl")
-        .args(["-sfL", "-o", &tmp_tar, &url])
-        .status();
-    match curl_status {
-        Ok(status) if status.success() => {}
-        _ => {
-            println!(
-                "{}[-] Failed to download {} -- package may not exist, or the network is unreachable.{}",
-                RED, pkg, RESET
-            );
-            let _ = fs::remove_file(&tmp_tar);
-            return false;
-        }
-    }
+    println!("{CYAN}[spk] Fetching {pkg}...{R}");
 
-    if let Err(e) = fs::create_dir_all(target_root) {
-        println!("{}[-] Failed to create target root {}: {}{}", RED, target_root, e, RESET);
-        let _ = fs::remove_file(&tmp_tar);
+    let ok = Command::new("curl")
+        .args(["-sfL", "-o", &tmp, &url])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+
+    if !ok {
+        println!("{RED}[spk] Failed to download {pkg} -- package may not exist or network is unreachable.{R}");
+        let _ = fs::remove_file(&tmp);
         return false;
     }
 
-    println!("{}[+] Extracting {} into {}...{}", CYAN, pkg, target_root, RESET);
-    let extract_cmd = format!("tar -xf '{}' -C '{}'", tmp_tar, target_root);
-    let extract_status = if is_root() {
-        Command::new("sh").arg("-c").arg(&extract_cmd).status()
+    let _ = fs::create_dir_all(root);
+
+    println!("{CYAN}[spk] Extracting {pkg} into {root}...{R}");
+    let extract = format!("tar -xf '{tmp}' -C '{root}'");
+    let result = if is_root() {
+        Command::new("sh").arg("-c").arg(&extract).status()
     } else {
         Command::new("sudo")
-            .args(["-S", "sh", "-c", &extract_cmd])
+            .args(["-S", "sh", "-c", &extract])
             .stdin(Stdio::inherit())
             .status()
     };
-    let _ = fs::remove_file(&tmp_tar);
+    let _ = fs::remove_file(&tmp);
 
-    match extract_status {
-        Ok(status) if status.success() => true,
+    match result {
+        Ok(s) if s.success() => {
+            println!("{GREEN}[spk] {pkg} installed.{R}");
+            true
+        }
         _ => {
-            println!("{}[-] Failed to extract {} into {}.{}", RED, pkg, target_root, RESET);
+            println!("{RED}[spk] Failed to extract {pkg}.{R}");
             false
         }
     }
 }
 
+fn cmd_install(pkg: &str) {
+    println!("{BOLD}[spk] Installing: {pkg}{R}");
+    if !fetch_and_install(pkg, target_root()) {
+        println!("{RED}{BOLD}[spk] Installation failed for {pkg}.{R}");
+        exit(1);
+    }
+    println!("{GREEN}{BOLD}[spk] {pkg} installed successfully.{R}");
+}
+
+fn cmd_system_upgrade() {
+    println!("{BOLD}{MAGENTA}[spk] System upgrade starting...{R}");
+
+    let mut failures: Vec<String> = Vec::new();
+
+    if is_smechvisor() {
+        println!("{CYAN}[spk] SmechVisor detected -- live OTA upgrade{R}");
+        for (pkg, needs_reboot) in SMECHVISOR_PACKAGES {
+            if *pkg == "smechvisor-daemon" {
+                // Live swap: stop daemon, replace binary, restart
+                let _ = Command::new("rc-service").args(["smechvisord", "stop"]).status();
+            }
+            if fetch_and_install(pkg, "/") {
+                if *pkg == "smechvisor-daemon" {
+                    let _ = Command::new("rc-service").args(["smechvisord", "start"]).status();
+                    println!("{GREEN}[spk] smechvisord restarted live -- no reboot needed.{R}");
+                } else if *needs_reboot {
+                    println!("{YELLOW}[spk] {pkg} updated -- reboot to activate.{R}");
+                }
+            } else {
+                if *pkg == "smechvisor-daemon" {
+                    // Re-start old binary even on failure
+                    let _ = Command::new("rc-service").args(["smechvisord", "start"]).status();
+                }
+                failures.push(pkg.to_string());
+            }
+        }
+    } else {
+        println!("{CYAN}[spk] SmechOS detected -- full system upgrade{R}");
+        let root = target_root();
+        for (i, pkg) in SMECHOS_PACKAGES.iter().enumerate() {
+            println!("{BOLD}[{}/{}] Re-fetching {pkg}...{R}", i + 1, SMECHOS_PACKAGES.len());
+            if !fetch_and_install(pkg, root) {
+                failures.push(pkg.to_string());
+            }
+        }
+    }
+
+    if failures.is_empty() {
+        println!("{GREEN}{BOLD}[spk] System upgrade complete. Sovereignty verified.{R}");
+    } else {
+        println!("{YELLOW}{BOLD}[spk] Upgrade complete with failures: {failures:?}{R}");
+        exit(1);
+    }
+}
+
+// ── Compile (build orchestration) ─────────────────────────────────────────────
+
+fn find_spk_compile() -> Option<String> {
+    let candidates = [
+        "/usr/share/spk/spk-compile.py",
+        "/opt/smechdeploy/spk-compile.py",
+        "spk-compile.py",
+    ];
+    for c in &candidates {
+        if Path::new(c).exists() {
+            return Some(c.to_string());
+        }
+    }
+    None
+}
+
+fn cmd_compile(args: &[String]) {
+    let script = match find_spk_compile() {
+        Some(s) => s,
+        None => {
+            println!("{RED}[spk] spk-compile.py not found.{R}");
+            println!("  Install it to one of:");
+            println!("    /usr/share/spk/spk-compile.py");
+            println!("    /opt/smechdeploy/spk-compile.py");
+            println!("  Or get SmechDeploy: https://github.com/Smech-Labs/SmechDeploy");
+            exit(1);
+        }
+    };
+    println!("{CYAN}[spk] Running build orchestrator: {script}{R}");
+    let status = Command::new("python3")
+        .arg(&script)
+        .args(args)
+        .status();
+    match status {
+        Ok(s) if s.success() => {}
+        Ok(s) => exit(s.code().unwrap_or(1)),
+        Err(e) => {
+            println!("{RED}[spk] Failed to run spk-compile.py: {e}{R}");
+            exit(1);
+        }
+    }
+}
+
+// ── Deploy (SmechVisor network deploy) ───────────────────────────────────────
+
+fn gen_code() -> String {
+    let t = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let pid = std::process::id() as u128;
+    format!("{:07x}", (t ^ (pid << 17)) & 0x0FFF_FFFF)
+}
+
+/// Push SmechVisor packages to a shim node that is broadcasting `code`.
+fn cmd_deploy_to(code: &str) {
+    println!("{CYAN}[spk] Listening for shim broadcasting code '{code}' on UDP {SHIM_UDP_PORT}...{R}");
+    let recv_sock = UdpSocket::bind(format!("0.0.0.0:{SHIM_UDP_PORT}"))
+        .expect("[spk] UDP listen bind failed");
+    recv_sock.set_read_timeout(Some(Duration::from_secs(120))).ok();
+
+    let expected = format!("{BROADCAST_MAGIC}:{code}");
+    let mut buf = [0u8; 256];
+
+    let shim_ip = loop {
+        match recv_sock.recv_from(&mut buf) {
+            Ok((n, addr)) => {
+                if String::from_utf8_lossy(&buf[..n]).trim() == expected {
+                    println!("{GREEN}[spk] Shim found at {}{R}", addr.ip());
+                    break addr.ip().to_string();
+                }
+            }
+            Err(_) => {
+                println!("{RED}[spk] Timed out. Is the shim ISO running on the target machine?{R}");
+                exit(1);
+            }
+        }
+    };
+
+    let tcp_addr = format!("{shim_ip}:{SHIM_TCP_PORT}");
+    println!("{CYAN}[spk] Connecting to shim TCP at {tcp_addr}...{R}");
+    let mut stream = std::net::TcpStream::connect(&tcp_addr)
+        .expect("[spk] TCP connect to shim failed");
+
+    let packages = ["smechvisor-base", "smechvisor-daemon"];
+    for pkg_name in &packages {
+        let url = format!("{RELEASE_BASE_URL}/{pkg_name}.tar.xz");
+        let tmp = format!("/tmp/spk-deploy-{pkg_name}.tar.xz");
+
+        println!("{CYAN}[spk] Fetching {pkg_name}...{R}");
+        let ok = Command::new("curl")
+            .args(["-sfL", "-o", &tmp, &url])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !ok {
+            println!("{YELLOW}[spk] Warning: failed to fetch {pkg_name}, skipping.{R}");
+            continue;
+        }
+
+        let data = fs::read(&tmp).expect("read package file");
+        let _ = fs::remove_file(&tmp);
+
+        let name_bytes = pkg_name.as_bytes();
+        stream.write_all(&(name_bytes.len() as u32).to_be_bytes()).ok();
+        stream.write_all(name_bytes).ok();
+        stream.write_all(&(data.len() as u64).to_be_bytes()).ok();
+        stream.write_all(&data).ok();
+        stream.flush().ok();
+        println!("{GREEN}[spk] Sent {pkg_name} ({} MB){R}", data.len() / 1_048_576);
+    }
+    // Terminator: 4-byte zero name length
+    stream.write_all(&0u32.to_be_bytes()).ok();
+    stream.flush().ok();
+    println!("{GREEN}{BOLD}[spk] All packages sent. Shim will install and reboot.{R}");
+}
+
+/// Receive a SmechVisor deploy from a donor node (runs on the shim).
+fn cmd_receive_deploy() {
+    let code = gen_code();
+
+    // Clear screen and show code banner
+    print!("\x1b[2J\x1b[H");
+    println!("{BOLD}{MAGENTA}");
+    println!("  +------------------------------------------+");
+    println!("  |      SMECHVISOR DEPLOY RECEIVER          |");
+    println!("  +------------------------------------------+");
+    println!("  |                                          |");
+    println!("  |  Your deploy code:                       |");
+    println!("  |                                          |");
+    println!("  |    {YELLOW}{code}{MAGENTA}                        |");
+    println!("  |                                          |");
+    println!("  |  On the donor node run:                  |");
+    println!("  |    spk deploy-system-img-copy {code}  |");
+    println!("  |                                          |");
+    println!("  +------------------------------------------+{R}");
+    println!();
+
+    // Broadcast UDP in background thread
+    let code_for_broadcast = code.clone();
+    std::thread::spawn(move || {
+        if let Ok(sock) = UdpSocket::bind("0.0.0.0:0") {
+            sock.set_broadcast(true).ok();
+            let msg = format!("{BROADCAST_MAGIC}:{code_for_broadcast}");
+            loop {
+                sock.send_to(msg.as_bytes(), format!("255.255.255.255:{SHIM_UDP_PORT}")).ok();
+                std::thread::sleep(Duration::from_secs(2));
+            }
+        }
+    });
+
+    // Listen for TCP from donor
+    let listener = TcpListener::bind(format!("0.0.0.0:{SHIM_TCP_PORT}"))
+        .expect("[spk] TCP bind failed");
+    println!("{CYAN}[spk] Waiting for donor on TCP port {SHIM_TCP_PORT}...{R}");
+    let (mut stream, addr) = listener.accept().expect("[spk] accept failed");
+    println!("{GREEN}[spk] Donor connected from {addr}{R}");
+
+    let target = "/mnt/target";
+    let _ = fs::create_dir_all(target);
+
+    loop {
+        let mut name_len_buf = [0u8; 4];
+        if stream.read_exact(&mut name_len_buf).is_err() {
+            break;
+        }
+        let name_len = u32::from_be_bytes(name_len_buf);
+        if name_len == 0 {
+            break; // terminator
+        }
+
+        let mut name_buf = vec![0u8; name_len as usize];
+        if stream.read_exact(&mut name_buf).is_err() {
+            break;
+        }
+        let name = String::from_utf8_lossy(&name_buf).to_string();
+
+        let mut data_len_buf = [0u8; 8];
+        stream.read_exact(&mut data_len_buf).expect("read data_len");
+        let data_len = u64::from_be_bytes(data_len_buf);
+
+        println!("{CYAN}[spk] Receiving '{name}' ({} MB)...{R}", data_len / 1_048_576);
+
+        // Stream directly into tar stdin to avoid buffering full package in RAM
+        let mut child = Command::new("tar")
+            .args(["-xJf", "-", "-C", target])
+            .stdin(Stdio::piped())
+            .spawn()
+            .expect("tar spawn");
+
+        let mut remaining = data_len;
+        let mut buf = [0u8; 65536];
+        if let Some(mut stdin) = child.stdin.take() {
+            while remaining > 0 {
+                let to_read = remaining.min(buf.len() as u64) as usize;
+                match stream.read(&mut buf[..to_read]) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        if stdin.write_all(&buf[..n]).is_err() {
+                            break;
+                        }
+                        remaining -= n as u64;
+                    }
+                    Err(_) => break,
+                }
+            }
+        }
+        child.wait().ok();
+        println!("{GREEN}[spk] '{name}' installed into {target}.{R}");
+    }
+
+    println!("{GREEN}{BOLD}[spk] Receive complete. Rebooting...{R}");
+    let _ = Command::new("sync").status();
+    let _ = Command::new("reboot").arg("-f").spawn();
+    std::thread::sleep(Duration::from_secs(5));
+}
+
+// ── PackageKit backend (script protocol) ─────────────────────────────────────
+//
+// PackageKit spawns this as `spk packagekit-backend` and communicates via
+// stdin/stdout using a line-based protocol. Plasma Discover and any other
+// PackageKit frontend can then use SPK to install/list packages.
+//
+// Response format per line:
+//   package\t<status>\t<id>\t<summary>     (id = name;version;arch;repo)
+//   progress\t<percent>
+//   status\t<status_string>
+//   error\t<errorcode>\t<message>
+//   finished
+//
+fn cmd_packagekit_backend() {
+    let stdin = std::io::stdin();
+    let mut stdout = std::io::stdout();
+
+    macro_rules! pk_write {
+        ($($arg:tt)*) => {
+            let _ = writeln!(stdout, $($arg)*);
+            let _ = stdout.flush();
+        };
+    }
+
+    let reader = BufReader::new(stdin.lock());
+    for line in reader.lines() {
+        let line = match line {
+            Ok(l) => l,
+            Err(_) => break,
+        };
+        let parts: Vec<&str> = line.trim().splitn(5, '\t').collect();
+        if parts.is_empty() {
+            continue;
+        }
+
+        match parts[0] {
+            "get-packages" => {
+                // List known packages
+                pk_write!("status\tquery");
+                for pkg in SMECHOS_PACKAGES {
+                    pk_write!("package\tavailable\t{};2.0.0;x86_64;smechos\tSmechOS package: {pkg}", pkg);
+                }
+                pk_write!("finished");
+            }
+            "resolve" => {
+                // Resolve a package name to ID. parts[2] is the package name.
+                let pkg = if parts.len() > 2 { parts[2] } else { "" };
+                pk_write!("status\tquery");
+                if SMECHOS_PACKAGES.contains(&pkg) {
+                    pk_write!("package\tavailable\t{pkg};2.0.0;x86_64;smechos\tSmechOS package: {pkg}");
+                } else {
+                    pk_write!("error\tpackage-not-found\tPackage '{pkg}' not found in SPK repos");
+                }
+                pk_write!("finished");
+            }
+            "install-packages" => {
+                // parts[2] contains semicolon-separated package IDs like "base-system;2.0.0;x86_64;smechos"
+                let pkg_id = if parts.len() > 2 { parts[2] } else { "" };
+                let pkg_name = pkg_id.split(';').next().unwrap_or(pkg_id);
+                pk_write!("status\tinstall");
+                pk_write!("package\tinstalling\t{pkg_id}\tInstalling {pkg_name}...");
+                pk_write!("progress\t10");
+                if fetch_and_install(pkg_name, target_root()) {
+                    pk_write!("progress\t100");
+                    pk_write!("package\tinstalled\t{pkg_id}\t{pkg_name} installed");
+                    pk_write!("finished");
+                } else {
+                    pk_write!("error\tpackage-install-failed\tFailed to install {pkg_name}");
+                    pk_write!("finished");
+                }
+            }
+            "remove-packages" => {
+                // SPK packages are tarballs extracted to root -- removal is not yet supported
+                pk_write!("error\tnot-supported\tSPK does not support package removal in this version");
+                pk_write!("finished");
+            }
+            "update-packages" | "get-updates" => {
+                pk_write!("status\tquery");
+                for pkg in SMECHOS_PACKAGES {
+                    pk_write!("package\tavailable\t{};2.0.0;x86_64;smechos\tUpdate available: {pkg}", pkg);
+                }
+                pk_write!("finished");
+            }
+            "refresh-cache" => {
+                // Nothing to refresh -- packages are fetched from GitHub Releases on demand
+                pk_write!("status\trefresh-cache");
+                pk_write!("finished");
+            }
+            "get-repo-list" => {
+                pk_write!("status\tquery");
+                pk_write!("repo-detail\tsmechos\tSmech Labs Package Repository\ttrue");
+                pk_write!("finished");
+            }
+            "quit" | "" => break,
+            other => {
+                pk_write!("error\tnot-supported\tUnknown command: {other}");
+                pk_write!("finished");
+            }
+        }
+    }
+}
+
+// ── Main ──────────────────────────────────────────────────────────────────────
+
 fn main() {
     let args: Vec<String> = env::args().collect();
+
     if args.len() < 2 {
         print_help();
         exit(0);
     }
 
-    let command = args[1].as_str();
+    match args[1].as_str() {
+        "help" | "--help" | "-h" => print_help(),
 
-    match command {
-        "help" | "--help" | "-h" => {
-            print_help();
-        }
-        "about" | "--about" => {
-            print_about();
-        }
-        "system-install" | "userland-install" => {
+        "version" | "--version" | "-v" => println!("spk {VERSION}"),
+
+        "about" | "--about" => print_about(),
+
+        "install" => {
             if args.len() < 3 {
-                println!("{}[-] Error: Please specify a package to install.{}", BOLD, RESET);
-                println!("    Example: spk {} base-system", command);
+                println!("{RED}[spk] Error: specify a package.   spk install <pkg>{R}");
                 exit(1);
             }
-            let pkg = &args[2];
-            let label = if command == "system-install" { "SYSTEM" } else { "USERLAND" };
-            println!("{}====================================================", BOLD);
-            println!("  SPK: INSTALLING {} PACKAGE: {}", label, pkg);
-            println!("===================================================={}", RESET);
-
-            let (is_host, target_dir) = get_target_context();
-            let target_root = if is_host { target_dir } else { "/" };
-
-            if fetch_and_install_package(pkg, target_root) {
-                println!("{} [+] Package {} installed successfully!{}", BOLD, pkg, RESET);
-            } else {
-                println!("{} [-] Installation failed for package {}.{}", BOLD, pkg, RESET);
-                exit(1);
-            }
+            cmd_install(&args[2]);
         }
+
+        "system-upgrade" => cmd_system_upgrade(),
+
+        "compile" => {
+            // Forward everything after "compile" to spk-compile.py
+            cmd_compile(&args[2..].to_vec());
+        }
+
+        "deploy-system-img-copy" => {
+            if args.len() < 3 {
+                println!("{RED}[spk] Error: specify a code.   spk deploy-system-img-copy <code>{R}");
+                exit(1);
+            }
+            cmd_deploy_to(&args[2]);
+        }
+
+        "receive-deploy" => cmd_receive_deploy(),
+
+        "packagekit-backend" => cmd_packagekit_backend(),
+
+        // ── Legacy aliases (v1.x compat) ─────────────────────────────────────
+        "system-install" | "userland-install" => {
+            println!("{YELLOW}[spk] '{} <pkg>' is now 'spk install <pkg>'{R}", args[1]);
+            if args.len() < 3 {
+                println!("{RED}[spk] Error: specify a package.{R}");
+                exit(1);
+            }
+            cmd_install(&args[2]);
+        }
+
         "entire-system-upgrade" => {
-            println!("{}{}{}========================================================================{}", BOLD, MAGENTA, RESET, RESET);
-            println!("{}{}        SMECHOS SOVEREIGN PACKAGE KEEPER (SPK) - FULL UPGRADE HUD{}", BOLD, CYAN, RESET);
-            println!("{}{}{}========================================================================{}", BOLD, MAGENTA, RESET, RESET);
-
-            let (is_host, target_dir) = get_target_context();
-            let target_root = if is_host { target_dir } else { "/" };
-            if is_host {
-                println!("    - Context: Host system (targeting SmechOS rootfs at {})", target_dir);
-            } else {
-                println!("    - Context: Target SmechOS local env");
-            }
-            println!("{}{}{}========================================================================{}", BOLD, MAGENTA, RESET, RESET);
-
-            let mut failures = Vec::new();
-            for (i, pkg) in KNOWN_PACKAGES.iter().enumerate() {
-                println!(
-                    "\n{}[{}/{}] Re-fetching {}...{}",
-                    BOLD,
-                    i + 1,
-                    KNOWN_PACKAGES.len(),
-                    pkg,
-                    RESET
-                );
-                if !fetch_and_install_package(pkg, target_root) {
-                    failures.push(*pkg);
-                }
-            }
-
-            if failures.is_empty() {
-                println!("\n{}{}{}========================================================================{}", BOLD, GREEN, RESET, RESET);
-                println!("{}{}          SMECHOS SYSTEM COMPILATION & UPGRADE COMPLETED!{}", BOLD, GREEN, RESET);
-                println!("{}            Sovereignty verified. Your workstation is secure.{}", BOLD, RESET);
-                println!("{}{}{}========================================================================{}", BOLD, GREEN, RESET, RESET);
-            } else {
-                println!("\n{}{}{}========================================================================{}", BOLD, YELLOW, RESET, RESET);
-                println!("{}{}    SMECHOS UPGRADE COMPLETED WITH FAILURES: {:?}{}", BOLD, YELLOW, failures, RESET);
-                println!("{}{}{}========================================================================{}", BOLD, YELLOW, RESET, RESET);
-                exit(1);
-            }
+            println!("{YELLOW}[spk] 'entire-system-upgrade' is now 'spk system-upgrade'{R}");
+            cmd_system_upgrade();
         }
-        _ => {
-            println!("{}[-] Error: Unknown command: '{}'{}", BOLD, command, RESET);
-            println!("    Use 'spk help' to see valid commands.");
+
+        unknown => {
+            println!("{RED}[spk] Unknown command: '{unknown}'{R}");
+            println!("  Use '{BOLD}spk help{R}' to see valid commands.");
             exit(1);
         }
     }
