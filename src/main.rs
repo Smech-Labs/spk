@@ -273,7 +273,7 @@ fn cmd_compile(args: &[String]) {
             println!("  Install it to one of:");
             println!("    /usr/share/spk/spk-compile.py");
             println!("    /opt/smechdeploy/spk-compile.py");
-            println!("  Or get SmechDeploy: https://github.com/Smech-Labs/SmechDeploy");
+            println!("  Or get spk-compile: https://github.com/Smech-Labs/spk-compile");
             exit(1);
         }
     };
@@ -501,28 +501,33 @@ fn cmd_packagekit_backend() {
             continue;
         }
 
+        // Build the active package list based on which OS we're running on
+        let active_pkgs: Vec<&str> = if is_smechvisor() {
+            SMECHVISOR_PACKAGES.iter().map(|(n, _)| *n).collect()
+        } else {
+            SMECHOS_PACKAGES.to_vec()
+        };
+        let repo_id = if is_smechvisor() { "smechvisor" } else { "smechos" };
+
         match parts[0] {
             "get-packages" => {
-                // List known packages
                 pk_write!("status\tquery");
-                for pkg in SMECHOS_PACKAGES {
-                    pk_write!("package\tavailable\t{};2.0.0;x86_64;smechos\tSmechOS package: {pkg}", pkg);
+                for pkg in &active_pkgs {
+                    pk_write!("package\tavailable\t{pkg};2.0.0;x86_64;{repo_id}\tSmech Labs package: {pkg}");
                 }
                 pk_write!("finished");
             }
             "resolve" => {
-                // Resolve a package name to ID. parts[2] is the package name.
                 let pkg = if parts.len() > 2 { parts[2] } else { "" };
                 pk_write!("status\tquery");
-                if SMECHOS_PACKAGES.contains(&pkg) {
-                    pk_write!("package\tavailable\t{pkg};2.0.0;x86_64;smechos\tSmechOS package: {pkg}");
+                if active_pkgs.contains(&pkg) {
+                    pk_write!("package\tavailable\t{pkg};2.0.0;x86_64;{repo_id}\tSmech Labs package: {pkg}");
                 } else {
                     pk_write!("error\tpackage-not-found\tPackage '{pkg}' not found in SPK repos");
                 }
                 pk_write!("finished");
             }
             "install-packages" => {
-                // parts[2] contains semicolon-separated package IDs like "base-system;2.0.0;x86_64;smechos"
                 let pkg_id = if parts.len() > 2 { parts[2] } else { "" };
                 let pkg_name = pkg_id.split(';').next().unwrap_or(pkg_id);
                 pk_write!("status\tinstall");
@@ -538,25 +543,23 @@ fn cmd_packagekit_backend() {
                 }
             }
             "remove-packages" => {
-                // SPK packages are tarballs extracted to root -- removal is not yet supported
                 pk_write!("error\tnot-supported\tSPK does not support package removal in this version");
                 pk_write!("finished");
             }
             "update-packages" | "get-updates" => {
                 pk_write!("status\tquery");
-                for pkg in SMECHOS_PACKAGES {
-                    pk_write!("package\tavailable\t{};2.0.0;x86_64;smechos\tUpdate available: {pkg}", pkg);
+                for pkg in &active_pkgs {
+                    pk_write!("package\tavailable\t{pkg};2.0.0;x86_64;{repo_id}\tUpdate available: {pkg}");
                 }
                 pk_write!("finished");
             }
             "refresh-cache" => {
-                // Nothing to refresh -- packages are fetched from GitHub Releases on demand
                 pk_write!("status\trefresh-cache");
                 pk_write!("finished");
             }
             "get-repo-list" => {
                 pk_write!("status\tquery");
-                pk_write!("repo-detail\tsmechos\tSmech Labs Package Repository\ttrue");
+                pk_write!("repo-detail\t{repo_id}\tSmech Labs Package Repository\ttrue");
                 pk_write!("finished");
             }
             "quit" | "" => break,
