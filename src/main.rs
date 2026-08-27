@@ -17,9 +17,158 @@ const MAGENTA: &str = "\x1b[35m";
 
 // ── Config ────────────────────────────────────────────────────────────────────
 const VERSION: &str = "2.0.1";
-const RELEASE_BASE_URL: &str =
+// Fallback used only if /etc/spk-repo-conf.yaml is missing or fails to parse
+// (e.g. a system that predates this file, or one where it was deleted).
+const DEFAULT_RELEASE_URL: &str =
     "https://github.com/Smech-Labs/SmechDeploy/releases/download/v1.0.0-packages";
+const REPO_CONF_PATH: &str = "/etc/spk-repo-conf.yaml";
 const DOCS_URL: &str = "https://docs.smech.xyz";
+
+// ── Repo config ───────────────────────────────────────────────────────────────
+// /etc/spk-repo-conf.yaml lets an operator point spk at one or more package
+// repos without hardcoding a URL into the binary. Deliberately hand-parsed
+// rather than pulling in a YAML crate -- spk is a zero-dependency binary by
+// design (see Cargo.toml), and the schema this file actually needs is small
+// and fixed enough that a general-purpose parser isn't worth that tradeoff.
+//
+// Priority: 1 is tried first, up to 99 for ordinary lower-priority mirrors.
+// 100 is a distinct "insecure/untrusted" tier, not just "even lower
+// priority" -- those repos are only ever used as a last resort after every
+// other configured repo has failed, and only with a loud warning printed
+// first, since silently falling back to an operator-marked-untrusted source
+// is exactly the kind of thing CONTRIBUTING.md's security section warns
+// against normalizing.
+struct Repo {
+    name: String,
+    url: String,
+    priority: u8,
+}
+
+fn default_repos() -> Vec<Repo> {
+    vec![Repo {
+        name: "default".to_string(),
+        url: DEFAULT_RELEASE_URL.to_string(),
+        priority: 1,
+    }]
+}
+
+fn parse_repo_conf(text: &str) -> Vec<Repo> {
+    let mut repos = Vec::new();
+    let mut cur_name: Option<String> = None;
+    let mut cur_url: Option<String> = None;
+    let mut cur_priority: Option<u8> = None;
+    let mut in_repos_list = false;
+
+    fn flush(
+        repos: &mut Vec<Repo>,
+        name: &mut Option<String>,
+        url: &mut Option<String>,
+        priority: &mut Option<u8>,
+    ) {
+        if let (Some(n), Some(u)) = (name.take(), url.take()) {
+            repos.push(Repo {
+                name: n,
+                url: u,
+                priority: priority.take().unwrap_or(50),
+            });
+        } else {
+            *priority = None;
+        }
+    }
+
+    fn unquote(s: &str) -> String {
+        let s = s.trim();
+        let s = s.strip_prefix('"').and_then(|s| s.strip_suffix('"')).unwrap_or(s);
+        let s = s.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')).unwrap_or(s);
+        s.to_string()
+    }
+
+    for raw_line in text.lines() {
+        let line = raw_line.split('#').next().unwrap_or("");
+        if line.trim().is_empty() {
+            continue;
+        }
+        let trimmed = line.trim_start();
+
+        if !in_repos_list {
+            if trimmed.starts_with("repos:") {
+                in_repos_list = true;
+            }
+            continue;
+        }
+
+        if trimmed.starts_with("- ") || trimmed == "-" {
+            flush(&mut repos, &mut cur_name, &mut cur_url, &mut cur_priority);
+            let rest = trimmed.trim_start_matches('-').trim_start();
+            if let Some((k, v)) = rest.split_once(':') {
+                match k.trim() {
+                    "name" => cur_name = Some(unquote(v)),
+                    "url" => cur_url = Some(unquote(v)),
+                    "priority" => cur_priority = v.trim().parse().ok(),
+                    _ => {}
+                }
+            }
+            continue;
+        }
+
+        if let Some((k, v)) = trimmed.split_once(':') {
+            match k.trim() {
+                "name" => cur_name = Some(unquote(v)),
+                "url" => cur_url = Some(unquote(v)),
+                "priority" => cur_priority = v.trim().parse().ok(),
+                _ => {}
+            }
+        }
+    }
+    flush(&mut repos, &mut cur_name, &mut cur_url, &mut cur_priority);
+    repos
+}
+
+fn load_repos() -> Vec<Repo> {
+    match fs::read_to_string(REPO_CONF_PATH) {
+        Ok(text) => {
+            let mut repos = parse_repo_conf(&text);
+            if repos.is_empty() {
+                println!(
+                    "{YELLOW}[spk] {REPO_CONF_PATH} has no usable repos, using built-in default.{R}"
+                );
+                repos = default_repos();
+            }
+            repos.sort_by_key(|r| r.priority);
+            repos
+        }
+        Err(_) => default_repos(),
+    }
+}
+
+/// Tries every configured repo in priority order (1 first), skipping the
+/// insecure/untrusted tier (priority 100) unless nothing else worked.
+/// Returns true and leaves the package at `dest_tmp` on the first success.
+fn fetch_package(pkg: &str, dest_tmp: &str) -> bool {
+    let repos = load_repos();
+    let (trusted, untrusted): (Vec<_>, Vec<_>) = repos.iter().partition(|r| r.priority < 100);
+
+    for repo in trusted.iter().chain(untrusted.iter()) {
+        if repo.priority >= 100 {
+            println!(
+                "{RED}{BOLD}[spk] WARNING: falling back to untrusted repo '{}' ({}) -- \
+                 every configured trusted repo failed.{R}",
+                repo.name, repo.url
+            );
+        }
+        let url = format!("{}/{pkg}.tar.xz", repo.url.trim_end_matches('/'));
+        let ok = Command::new("curl")
+            .args(["-sfL", "-o", dest_tmp, &url])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if ok {
+            return true;
+        }
+        let _ = fs::remove_file(dest_tmp);
+    }
+    false
+}
 
 // Packages currently published in the release above. Used by system-upgrade to
 // know what to re-fetch; install can fetch any package name (unknown ones just
@@ -151,19 +300,12 @@ fn is_smechvisor() -> bool {
 // ── Package install ───────────────────────────────────────────────────────────
 
 fn fetch_and_install(pkg: &str, root: &str) -> bool {
-    let url = format!("{RELEASE_BASE_URL}/{pkg}.tar.xz");
     let tmp = format!("/tmp/spk-{pkg}.tar.xz");
 
     println!("{CYAN}[spk] Fetching {pkg}...{R}");
 
-    let ok = Command::new("curl")
-        .args(["-sfL", "-o", &tmp, &url])
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
-
-    if !ok {
-        println!("{RED}[spk] Failed to download {pkg} -- package may not exist or network is unreachable.{R}");
+    if !fetch_package(pkg, &tmp) {
+        println!("{RED}[spk] Failed to download {pkg} -- package may not exist on any configured repo, or network is unreachable.{R}");
         let _ = fs::remove_file(&tmp);
         return false;
     }
@@ -335,15 +477,10 @@ fn cmd_deploy_to(code: &str) {
 
     let packages = ["smechvisor-base", "smechvisor-daemon"];
     for pkg_name in &packages {
-        let url = format!("{RELEASE_BASE_URL}/{pkg_name}.tar.xz");
         let tmp = format!("/tmp/spk-deploy-{pkg_name}.tar.xz");
 
         println!("{CYAN}[spk] Fetching {pkg_name}...{R}");
-        let ok = Command::new("curl")
-            .args(["-sfL", "-o", &tmp, &url])
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
+        let ok = fetch_package(pkg_name, &tmp);
         if !ok {
             println!("{YELLOW}[spk] Warning: failed to fetch {pkg_name}, skipping.{R}");
             continue;
@@ -635,5 +772,99 @@ fn main() {
             println!("  Use '{BOLD}spk help{R}' to see valid commands.");
             exit(1);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_multiple_repos_with_priority_order() {
+        let yaml = r#"
+repos:
+  - name: primary
+    url: https://pkg.smech.xyz
+    priority: 1
+  - name: github-fallback
+    url: https://github.com/Smech-Labs/SmechDeploy/releases/download/v1.0.0-packages
+    priority: 50
+  - name: sketchy-mirror
+    url: http://example.com/mirror
+    priority: 100
+"#;
+        let mut repos = parse_repo_conf(yaml);
+        assert_eq!(repos.len(), 3);
+        repos.sort_by_key(|r| r.priority);
+        assert_eq!(repos[0].name, "primary");
+        assert_eq!(repos[0].priority, 1);
+        assert_eq!(repos[1].name, "github-fallback");
+        assert_eq!(repos[1].priority, 50);
+        assert_eq!(repos[2].name, "sketchy-mirror");
+        assert_eq!(repos[2].priority, 100);
+    }
+
+    #[test]
+    fn defaults_missing_priority_to_50() {
+        let yaml = r#"
+repos:
+  - name: no-priority
+    url: https://example.com
+"#;
+        let repos = parse_repo_conf(yaml);
+        assert_eq!(repos.len(), 1);
+        assert_eq!(repos[0].priority, 50);
+    }
+
+    #[test]
+    fn ignores_comments_and_blank_lines() {
+        let yaml = r#"
+# top comment
+repos:
+  # a comment inside the list too
+  - name: one
+
+    url: https://example.com/one
+    priority: 5
+"#;
+        let repos = parse_repo_conf(yaml);
+        assert_eq!(repos.len(), 1);
+        assert_eq!(repos[0].name, "one");
+        assert_eq!(repos[0].url, "https://example.com/one");
+        assert_eq!(repos[0].priority, 5);
+    }
+
+    #[test]
+    fn handles_quoted_values() {
+        let yaml = r#"
+repos:
+  - name: "quoted"
+    url: 'https://example.com/single'
+    priority: 3
+"#;
+        let repos = parse_repo_conf(yaml);
+        assert_eq!(repos[0].name, "quoted");
+        assert_eq!(repos[0].url, "https://example.com/single");
+    }
+
+    #[test]
+    fn empty_input_yields_no_repos() {
+        assert!(parse_repo_conf("").is_empty());
+        assert!(parse_repo_conf("some: other\nyaml: entirely").is_empty());
+    }
+
+    #[test]
+    fn single_repo_no_list_wrapper_needed() {
+        // The user explicitly said "just a single repo" should be fine too --
+        // confirm one-entry lists parse identically to multi-entry ones.
+        let yaml = r#"
+repos:
+  - name: only
+    url: https://pkg.smech.xyz
+    priority: 1
+"#;
+        let repos = parse_repo_conf(yaml);
+        assert_eq!(repos.len(), 1);
+        assert_eq!(repos[0].url, "https://pkg.smech.xyz");
     }
 }
