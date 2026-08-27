@@ -16,7 +16,7 @@ const RED: &str = "\x1b[31m";
 const MAGENTA: &str = "\x1b[35m";
 
 // ── Config ────────────────────────────────────────────────────────────────────
-const VERSION: &str = "2.0.1";
+const VERSION: &str = "2.1.0";
 // Fallback used only if /etc/spk-repo-conf.yaml is missing or fails to parse
 // (e.g. a system that predates this file, or one where it was deleted).
 const DEFAULT_RELEASE_URL: &str =
