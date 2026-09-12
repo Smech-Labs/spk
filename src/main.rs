@@ -16,7 +16,7 @@ const RED: &str = "\x1b[31m";
 const MAGENTA: &str = "\x1b[35m";
 
 // ── Config ────────────────────────────────────────────────────────────────────
-const VERSION: &str = "2.1.0";
+const VERSION: &str = "2.2.0";
 // Fallback used only if /etc/spk-repo-conf.yaml is missing or fails to parse
 // (e.g. a system that predates this file, or one where it was deleted).
 const DEFAULT_RELEASE_URL: &str =
@@ -144,7 +144,10 @@ fn load_repos() -> Vec<Repo> {
 /// Tries every configured repo in priority order (1 first), skipping the
 /// insecure/untrusted tier (priority 100) unless nothing else worked.
 /// Returns true and leaves the package at `dest_tmp` on the first success.
-fn fetch_package(pkg: &str, dest_tmp: &str) -> bool {
+/// A repo's `url` can be `file:///abs/path` (see `local-package-repo`) as
+/// well as http(s) -- curl handles both transparently, so this needed no
+/// new fetch logic of its own.
+fn fetch_package_ext(pkg: &str, ext: &str, dest_tmp: &str) -> bool {
     let repos = load_repos();
     let (trusted, untrusted): (Vec<_>, Vec<_>) = repos.iter().partition(|r| r.priority < 100);
 
@@ -156,7 +159,7 @@ fn fetch_package(pkg: &str, dest_tmp: &str) -> bool {
                 repo.name, repo.url
             );
         }
-        let url = format!("{}/{pkg}.tar.xz", repo.url.trim_end_matches('/'));
+        let url = format!("{}/{pkg}.{ext}", repo.url.trim_end_matches('/'));
         let ok = Command::new("curl")
             .args(["-sfL", "-o", dest_tmp, &url])
             .status()
@@ -168,6 +171,14 @@ fn fetch_package(pkg: &str, dest_tmp: &str) -> bool {
         let _ = fs::remove_file(dest_tmp);
     }
     false
+}
+
+/// Legacy name/signature preserved for cmd_deploy_to, which always wants
+/// the raw .tar.xz bytes to stream verbatim over the SmechVisor deploy
+/// wire protocol -- that path predates .spkg and isn't part of this
+/// migration.
+fn fetch_package(pkg: &str, dest_tmp: &str) -> bool {
+    fetch_package_ext(pkg, "tar.xz", dest_tmp)
 }
 
 // Packages currently published in the release above. Used by system-upgrade to
@@ -218,7 +229,12 @@ fn print_help() {
     println!("{BOLD}USAGE:{R}  spk <COMMAND> [args...]");
     println!();
     println!("{BOLD}PACKAGE MANAGEMENT{R}");
-    println!("    {GREEN}install <pkg>{R}              Fetch and install a package");
+    println!("    {GREEN}install <pkg>{R}              Fetch and install a package from a repo");
+    println!("    {GREEN}install --local-package <path>{R}  Install a local .spkg file (the only");
+    println!("                                     way to install from disk -- a bare path");
+    println!("                                     to 'install' is rejected on purpose)");
+    println!("    {GREEN}local-package-repo <folder>{R}  Point 'install <name>' at a local folder");
+    println!("                                     of .spkg files too (priority 1)");
     println!("    {GREEN}system-upgrade{R}             Re-fetch and reinstall all known packages");
     println!();
     println!("{BOLD}BUILD (native orchestration via spk-compile.py){R}");
@@ -297,14 +313,179 @@ fn is_smechvisor() -> bool {
         || Path::new("/etc/smechvisor-release").exists()
 }
 
+// ── .spkg format ──────────────────────────────────────────────────────────────
+//
+// A .spkg is a plain (uncompressed) outer tar -- no point double-compressing
+// what's already xz'd inside -- containing exactly two members, deb-style:
+//
+//   control.tar.xz   metadata (a `control` key:value file) + optional
+//                     preinst/postinst/prerm/postrm executable scripts
+//   data.tar.xz       payload, paths relative to the install root
+//
+// Kept implementable with zero new crates: the outer container and both
+// inner members are handled with the same `tar` shell-out already used for
+// legacy .tar.xz packages, and `control` is hand-parsed with the same
+// "key: value, # comments stripped" scanner style already used for
+// spk-repo-conf.yaml (see parse_repo_conf above).
+
+struct ControlMeta {
+    name: String,
+    version: String,
+    architecture: String,
+    depends: String,
+    description: String,
+}
+
+fn parse_control(text: &str) -> ControlMeta {
+    let mut m = ControlMeta {
+        name: String::new(),
+        version: String::new(),
+        architecture: String::new(),
+        depends: String::new(),
+        description: String::new(),
+    };
+    for raw_line in text.lines() {
+        let line = raw_line.split('#').next().unwrap_or("");
+        if let Some((k, v)) = line.split_once(':') {
+            let v = v.trim().to_string();
+            match k.trim() {
+                "name" => m.name = v,
+                "version" => m.version = v,
+                "architecture" => m.architecture = v,
+                "depends" => m.depends = v,
+                "description" => m.description = v,
+                _ => {}
+            }
+        }
+    }
+    m
+}
+
+fn run_hook_script(control_dir: &str, name: &str) {
+    let path = format!("{control_dir}/{name}");
+    if !Path::new(&path).exists() {
+        return;
+    }
+    let _ = Command::new("chmod").args(["+x", &path]).status();
+    match Command::new("sh").arg(&path).status() {
+        Ok(s) if s.success() => {}
+        _ => println!("{YELLOW}[spk] Warning: {name} script did not exit cleanly.{R}"),
+    }
+}
+
+/// Install a .spkg file already sitting on local disk into `root`. Used by
+/// both the repo-fetch path (fetch_and_install downloads to a temp file,
+/// then calls this) and `spk install --local-package` (calls this
+/// directly on the caller-given path, no fetch involved).
+fn install_spkg_file(spkg_path: &str, root: &str) -> bool {
+    let stage = format!("/tmp/spk-spkg-stage-{}", std::process::id());
+    let _ = fs::remove_dir_all(&stage);
+    if fs::create_dir_all(&stage).is_err() {
+        println!("{RED}[spk] Failed to create staging dir {stage}.{R}");
+        return false;
+    }
+    let outer_ok = Command::new("tar")
+        .args(["-xf", spkg_path, "-C", &stage])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !outer_ok {
+        println!("{RED}[spk] Failed to open {spkg_path} (not a valid .spkg?).{R}");
+        let _ = fs::remove_dir_all(&stage);
+        return false;
+    }
+
+    let control_tar = format!("{stage}/control.tar.xz");
+    let data_tar = format!("{stage}/data.tar.xz");
+    if !Path::new(&control_tar).exists() || !Path::new(&data_tar).exists() {
+        println!("{RED}[spk] {spkg_path} is missing control.tar.xz or data.tar.xz -- not a valid .spkg.{R}");
+        let _ = fs::remove_dir_all(&stage);
+        return false;
+    }
+
+    let control_dir = format!("{stage}/control");
+    let _ = fs::create_dir_all(&control_dir);
+    let control_ok = Command::new("tar")
+        .args(["-xf", &control_tar, "-C", &control_dir])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !control_ok {
+        println!("{RED}[spk] Failed to extract control.tar.xz from {spkg_path}.{R}");
+        let _ = fs::remove_dir_all(&stage);
+        return false;
+    }
+
+    let control_text =
+        fs::read_to_string(format!("{control_dir}/control")).unwrap_or_default();
+    let meta = parse_control(&control_text);
+    if meta.name.is_empty() {
+        println!("{RED}[spk] {spkg_path}'s control file has no 'name' field -- refusing to install.{R}");
+        let _ = fs::remove_dir_all(&stage);
+        return false;
+    }
+
+    println!("{BOLD}[spk] {} {} ({}){R}", meta.name, meta.version, meta.architecture);
+    if !meta.description.is_empty() {
+        println!("  {}", meta.description);
+    }
+    if !meta.depends.is_empty() {
+        println!("  {YELLOW}depends:{R} {}", meta.depends);
+    }
+
+    run_hook_script(&control_dir, "preinst");
+
+    let _ = fs::create_dir_all(root);
+    println!("{CYAN}[spk] Extracting {} into {root}...{R}", meta.name);
+    let extract = format!("tar -xf '{data_tar}' -C '{root}'");
+    let result = if is_root() {
+        Command::new("sh").arg("-c").arg(&extract).status()
+    } else {
+        Command::new("sudo")
+            .args(["-S", "sh", "-c", &extract])
+            .stdin(Stdio::inherit())
+            .status()
+    };
+
+    let ok = matches!(result, Ok(s) if s.success());
+    if ok {
+        run_hook_script(&control_dir, "postinst");
+        println!("{GREEN}[spk] {} installed.{R}", meta.name);
+    } else {
+        println!("{RED}[spk] Failed to extract data.tar.xz from {spkg_path}.{R}");
+    }
+    let _ = fs::remove_dir_all(&stage);
+    ok
+}
+
+/// A bare `spk install` argument that looks like a filesystem path rather
+/// than a repo package name -- used to reject that form outright instead
+/// of silently auto-detecting it. See cmd_install's caller in main() for
+/// the actual message; this only decides whether to trigger it.
+fn looks_like_local_path(s: &str) -> bool {
+    s.contains('/') || s.starts_with('.') || s.starts_with('~')
+        || s.ends_with(".spkg") || s.ends_with(".tar.xz")
+}
+
 // ── Package install ───────────────────────────────────────────────────────────
 
 fn fetch_and_install(pkg: &str, root: &str) -> bool {
-    let tmp = format!("/tmp/spk-{pkg}.tar.xz");
-
+    // Prefer the new .spkg format.
+    let spkg_tmp = format!("/tmp/spk-{pkg}.spkg");
     println!("{CYAN}[spk] Fetching {pkg}...{R}");
+    if fetch_package_ext(pkg, "spkg", &spkg_tmp) {
+        let ok = install_spkg_file(&spkg_tmp, root);
+        let _ = fs::remove_file(&spkg_tmp);
+        return ok;
+    }
+    let _ = fs::remove_file(&spkg_tmp);
 
-    if !fetch_package(pkg, &tmp) {
+    // Legacy bare .tar.xz fallback for repos that haven't migrated to
+    // .spkg yet -- kept deliberately during the transition rather than a
+    // hard cutover, so an operator's existing repo doesn't break outright.
+    let tmp = format!("/tmp/spk-{pkg}.tar.xz");
+    println!("{YELLOW}[spk] No {pkg}.spkg found -- trying legacy {pkg}.tar.xz...{R}");
+    if !fetch_package_ext(pkg, "tar.xz", &tmp) {
         println!("{RED}[spk] Failed to download {pkg} -- package may not exist on any configured repo, or network is unreachable.{R}");
         let _ = fs::remove_file(&tmp);
         return false;
@@ -343,6 +524,83 @@ fn cmd_install(pkg: &str) {
         exit(1);
     }
     println!("{GREEN}{BOLD}[spk] {pkg} installed successfully.{R}");
+}
+
+fn cmd_install_local(path: &str) {
+    if !Path::new(path).exists() {
+        println!("{RED}[spk] Error: '{path}' does not exist.{R}");
+        exit(1);
+    }
+    if !install_spkg_file(path, target_root()) {
+        println!("{RED}{BOLD}[spk] Local package installation failed.{R}");
+        exit(1);
+    }
+}
+
+/// Point `spk install <name>` (the ordinary, no-flag form) at a local
+/// directory of .spkg files too, by adding it to spk-repo-conf.yaml as a
+/// `file://` repo entry at the highest priority. Reuses fetch_package_ext
+/// verbatim -- curl already speaks file:// -- so this needed no new fetch
+/// code, just a config-writing subcommand.
+fn cmd_local_package_repo(folder: &str) {
+    let abs = match fs::canonicalize(folder) {
+        Ok(p) => p,
+        Err(_) => {
+            println!("{RED}[spk] Error: '{folder}' does not exist or is not accessible.{R}");
+            exit(1);
+        }
+    };
+    if !abs.is_dir() {
+        println!("{RED}[spk] Error: '{folder}' is not a directory.{R}");
+        exit(1);
+    }
+    let url = format!("file://{}", abs.display());
+
+    let mut repos = load_repos();
+    // Replace any existing "local" entry rather than accumulating
+    // duplicates -- only one local-package-repo is active at a time.
+    repos.retain(|r| r.name != "local");
+    repos.push(Repo {
+        name: "local".to_string(),
+        url,
+        priority: 1,
+    });
+    repos.sort_by_key(|r| r.priority);
+
+    let mut out = String::from("repos:\n");
+    for r in &repos {
+        out.push_str(&format!(
+            "  - name: {}\n    url: {}\n    priority: {}\n",
+            r.name, r.url, r.priority
+        ));
+    }
+
+    let write_ok = if is_root() {
+        fs::write(REPO_CONF_PATH, &out).is_ok()
+    } else {
+        match Command::new("sudo")
+            .args(["-S", "tee", REPO_CONF_PATH])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .spawn()
+        {
+            Ok(mut child) => {
+                if let Some(stdin) = child.stdin.as_mut() {
+                    let _ = stdin.write_all(out.as_bytes());
+                }
+                matches!(child.wait(), Ok(s) if s.success())
+            }
+            Err(_) => false,
+        }
+    };
+
+    if write_ok {
+        println!("{GREEN}[spk] Local package repo set: {}{R}", abs.display());
+        println!("  'spk install <name>' will check this folder first (priority 1).");
+    } else {
+        println!("{RED}[spk] Failed to write {REPO_CONF_PATH}.{R}");
+        exit(1);
+    }
 }
 
 fn cmd_system_upgrade() {
@@ -726,11 +984,52 @@ fn main() {
         "about" => print_about(),
 
         "install" => {
-            if args.len() < 3 {
+            let rest = &args[2..];
+            // --local-package <path>: the ONLY sanctioned way to install a
+            // local .spkg file. No warning here on success -- the flag
+            // itself already is the explicit "yes, I mean a local file"
+            // signal, so there's nothing left to confirm.
+            if let Some(pos) = rest.iter().position(|a| a == "--local-package") {
+                match rest.get(pos + 1) {
+                    Some(path) => cmd_install_local(path),
+                    None => {
+                        println!(
+                            "{RED}[spk] Error: --local-package requires a path.   \
+                             spk install --local-package /path/to/pkg.spkg{R}"
+                        );
+                        exit(1);
+                    }
+                }
+                return;
+            }
+
+            if rest.is_empty() {
                 println!("{RED}[spk] Error: specify a package.   spk install <pkg>{R}");
                 exit(1);
             }
-            cmd_install(&args[2]);
+            let pkg = &rest[0];
+            // A bare argument that looks like a filesystem path is a
+            // mistake worth catching explicitly, not silently guessing at
+            // -- "spk install <name>" only ever means "fetch from a
+            // configured repo".
+            if looks_like_local_path(pkg) {
+                println!("{RED}[spk] '{pkg}' looks like a local file, not a repo package name.{R}");
+                println!("  'spk install <name>' only fetches from configured repos.");
+                println!("  To install a local .spkg file, use:");
+                println!("    {BOLD}spk install --local-package {pkg}{R}");
+                exit(1);
+            }
+            cmd_install(pkg);
+        }
+
+        "local-package-repo" => {
+            if args.len() < 3 {
+                println!(
+                    "{RED}[spk] Error: specify a folder.   spk local-package-repo <folder>{R}"
+                );
+                exit(1);
+            }
+            cmd_local_package_repo(&args[2]);
         }
 
         "system-upgrade" => cmd_system_upgrade(),
@@ -866,5 +1165,36 @@ repos:
         let repos = parse_repo_conf(yaml);
         assert_eq!(repos.len(), 1);
         assert_eq!(repos[0].url, "https://pkg.smech.xyz");
+    }
+
+    #[test]
+    fn parses_control_file() {
+        let text = "name: kcoreaddons\nversion: 6.24.0\narchitecture: x86_64\ndepends: qt6-base\ndescription: KDE Frameworks - KCoreAddons\n";
+        let m = parse_control(text);
+        assert_eq!(m.name, "kcoreaddons");
+        assert_eq!(m.version, "6.24.0");
+        assert_eq!(m.architecture, "x86_64");
+        assert_eq!(m.depends, "qt6-base");
+        assert_eq!(m.description, "KDE Frameworks - KCoreAddons");
+    }
+
+    #[test]
+    fn control_file_ignores_comments() {
+        let text = "# a comment\nname: foo\n# depends: ignored\nversion: 1.0\n";
+        let m = parse_control(text);
+        assert_eq!(m.name, "foo");
+        assert_eq!(m.version, "1.0");
+        assert!(m.depends.is_empty());
+    }
+
+    #[test]
+    fn detects_local_paths() {
+        assert!(looks_like_local_path("./foo.spkg"));
+        assert!(looks_like_local_path("/home/smech/foo.spkg"));
+        assert!(looks_like_local_path("~/foo.spkg"));
+        assert!(looks_like_local_path("foo.spkg"));
+        assert!(looks_like_local_path("foo.tar.xz"));
+        assert!(!looks_like_local_path("firefox"));
+        assert!(!looks_like_local_path("kde-frameworks"));
     }
 }
