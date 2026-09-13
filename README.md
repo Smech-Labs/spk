@@ -14,6 +14,15 @@ spk install --local-package <path>   Install a local .spkg file (the ONLY way to
                                       rejected on purpose, see ".spkg format" below)
 spk local-package-repo <folder>      Point 'install <name>' at a local folder of .spkg
                                       files too, at priority 1 (highest)
+spk remove <pkg> [-y] [--force]      Uninstall a package. Refuses if another installed
+                                      package still depends on it (--force overrides).
+                                      Never deletes a file another installed package
+                                      also owns.
+spk list                             Show all installed packages
+spk depends <pkg>                    Show a package's dependency tree
+spk create-live-image <out.iso>      Build a bootable image straight from a repo's
+                                      published packages, not from source (needs a
+                                      repo with index.txt)
 spk system-upgrade                   Re-fetch and reinstall every known SmechOS package
 spk compile ...                      Forward to spk-compile.py (build orchestration)
 spk about                            Show version/credits
@@ -71,6 +80,61 @@ installs with no further warning.
 first). This needed no new fetch code at all: `curl` already speaks
 `file://` URLs natively, so it reuses the exact same repo-iteration path
 as any `https://` repo.
+
+## Installed-package database
+
+Every `install` (whether `.spkg` or legacy `.tar.xz`) writes a record to
+`/var/lib/spk/installed/<name>` (or `<root>/var/lib/spk/installed/<name>`
+when installing under an alternate root, e.g. `create-live-image`'s
+scratch chroot):
+
+```
+name: kcoreaddons
+version: 6.24.0
+architecture: x86_64
+depends: qt6-base
+files: usr/lib/libKF6CoreAddons.so.6, usr/lib/x86_64-linux-gnu/...
+```
+
+This is what makes `list`, `depends`, and `remove` possible without
+re-reading any archive:
+
+- **`spk depends <pkg>`** — parses `control`/the installed record's
+  `depends` field (`parse_depends` strips `(>= x.y.z)`-style version
+  annotations; version constraints are recorded but not enforced) and
+  recurses, printing a tree. Cycle-safe via a `seen` set.
+- **`spk remove <pkg>`** — first calls `find_dependents()` to refuse
+  removal if any other installed package still lists `<pkg>` in its own
+  `depends` (override with `--force`); then diffs `<pkg>`'s file list
+  against every *other* installed package's file list and only deletes
+  files nothing else still owns. `-y`/`--yes` skips the confirmation
+  prompt.
+- **`spk list`** — just lists everything under `installed/`.
+
+## `spk create-live-image`
+
+```
+spk create-live-image <out.iso> [extra-package-name...]
+```
+
+Builds a bootable image straight from a repo's already-published
+`.spkg` packages -- no compiler, no `spk-compile.py`, no source tree.
+It fetches `index.txt` (a sorted `name version` per line, written by
+`spk-compile`'s `phase_bundle_spkg_packages`) from the first configured
+repo that has one, installs every package it lists (plus any extra
+names given on the command line) into a scratch root, `mksquashfs`'s
+the result, and -- if the scratch root itself contains `/boot/vmlinuz`
+and `/boot/live-initrd.img` -- assembles a real bootable ISO via
+`grub-mkrescue` (preferring the scratch root's own from-source
+`usr/bin/grub-mkrescue` over the host's, same reasoning as
+`spk-compile.py`'s `_grub_mkrescue`). If those boot assets aren't part
+of the package set, it still emits the squashfs and says so plainly
+rather than producing a silently-broken ISO.
+
+This is the first real package-discovery mechanism in the system:
+earlier versions of `spk` had the SmechOS package list (`SMECHOS_PACKAGES`)
+hardcoded into the binary itself. `index.txt` replaces that with
+something a repo actually publishes.
 
 ## Build requirements
 

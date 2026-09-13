@@ -16,7 +16,7 @@ const RED: &str = "\x1b[31m";
 const MAGENTA: &str = "\x1b[35m";
 
 // ── Config ────────────────────────────────────────────────────────────────────
-const VERSION: &str = "2.3.0";
+const VERSION: &str = "2.4.0";
 // Fallback used only if /etc/spk-repo-conf.yaml is missing or fails to parse
 // (e.g. a system that predates this file, or one where it was deleted).
 const DEFAULT_RELEASE_URL: &str =
@@ -242,6 +242,9 @@ fn print_help() {
     println!("                                     installed package also owns)");
     println!("    {GREEN}list{R}                       Show all installed packages");
     println!("    {GREEN}depends <pkg>{R}              Show a package's dependency tree");
+    println!("    {GREEN}create-live-image <out.iso>{R}  Build a bootable image straight from a");
+    println!("                                     repo's published packages (needs a repo");
+    println!("                                     with index.txt -- see phase_bundle_spkg_packages)");
     println!("    {GREEN}system-upgrade{R}             Re-fetch and reinstall all known packages");
     println!();
     println!("{BOLD}BUILD (native orchestration via spk-compile.py){R}");
@@ -458,7 +461,7 @@ fn install_spkg_file_inner(spkg_path: &str, root: &str, resolving: &mut Vec<Stri
         }
     }
 
-    if is_installed(&meta.name) {
+    if is_installed(root, &meta.name) {
         println!("{YELLOW}[spk] {} is already installed -- reinstalling/upgrading over it.{R}", meta.name);
     }
 
@@ -500,7 +503,7 @@ fn install_spkg_file_inner(spkg_path: &str, root: &str, resolving: &mut Vec<Stri
             .filter(|l| !l.trim().is_empty() && *l != "." && !l.ends_with('/'))
             .map(|l| l.to_string())
             .collect();
-        if !write_installed_record(&meta, &files) {
+        if !write_installed_record(root, &meta, &files) {
             println!(
                 "{YELLOW}[spk] Warning: {} installed, but failed to write its record to \
                  {INSTALLED_DB_DIR} -- 'spk remove {}' won't know about it later.{R}",
@@ -514,7 +517,7 @@ fn install_spkg_file_inner(spkg_path: &str, root: &str, resolving: &mut Vec<Stri
             let src = format!("{control_dir}/{hook}");
             if Path::new(&src).exists() {
                 if let Ok(contents) = fs::read_to_string(&src) {
-                    write_root_file(&format!("{}.{hook}", installed_db_path(&meta.name)), &contents);
+                    write_root_file(&format!("{}.{hook}", installed_db_path(root, &meta.name)), &contents);
                 }
             }
         }
@@ -596,17 +599,33 @@ struct InstalledPkg {
     files: Vec<String>,
 }
 
-fn installed_db_path(name: &str) -> String {
-    format!("{INSTALLED_DB_DIR}/{name}")
+/// The installed-db directory lives under `root` itself, not always the
+/// host's absolute /var/lib/spk/installed -- a scratch root being
+/// assembled by `create-live-image` needs its OWN db (so the resulting
+/// image boots with a real record of what's on it), and even an
+/// ordinary `/mnt/smechos` install target should track installs there,
+/// not silently in the host's own db. root="/" (the ordinary case)
+/// collapses back to the plain absolute path.
+fn installed_db_dir(root: &str) -> String {
+    let trimmed = root.trim_end_matches('/');
+    if trimmed.is_empty() {
+        INSTALLED_DB_DIR.to_string()
+    } else {
+        format!("{trimmed}{INSTALLED_DB_DIR}")
+    }
 }
 
-fn is_installed(name: &str) -> bool {
-    Path::new(&installed_db_path(name)).exists()
+fn installed_db_path(root: &str, name: &str) -> String {
+    format!("{}/{name}", installed_db_dir(root))
 }
 
-fn list_installed_names() -> Vec<String> {
+fn is_installed(root: &str, name: &str) -> bool {
+    Path::new(&installed_db_path(root, name)).exists()
+}
+
+fn list_installed_names(root: &str) -> Vec<String> {
     let mut names = Vec::new();
-    if let Ok(entries) = fs::read_dir(INSTALLED_DB_DIR) {
+    if let Ok(entries) = fs::read_dir(installed_db_dir(root)) {
         for e in entries.flatten() {
             if e.path().is_file() {
                 if let Some(n) = e.file_name().to_str() {
@@ -619,8 +638,8 @@ fn list_installed_names() -> Vec<String> {
     names
 }
 
-fn read_installed(name: &str) -> Option<InstalledPkg> {
-    let text = fs::read_to_string(installed_db_path(name)).ok()?;
+fn read_installed(root: &str, name: &str) -> Option<InstalledPkg> {
+    let text = fs::read_to_string(installed_db_path(root, name)).ok()?;
     let mut version = String::new();
     let mut depends = String::new();
     let mut files = Vec::new();
@@ -652,8 +671,8 @@ fn read_installed(name: &str) -> Option<InstalledPkg> {
     })
 }
 
-fn write_installed_record(meta: &ControlMeta, files: &[String]) -> bool {
-    if !ensure_root_dir(INSTALLED_DB_DIR) {
+fn write_installed_record(root: &str, meta: &ControlMeta, files: &[String]) -> bool {
+    if !ensure_root_dir(&installed_db_dir(root)) {
         return false;
     }
     let mut out = String::new();
@@ -665,7 +684,7 @@ fn write_installed_record(meta: &ControlMeta, files: &[String]) -> bool {
         out.push_str(f);
         out.push('\n');
     }
-    write_root_file(&installed_db_path(&meta.name), &out)
+    write_root_file(&installed_db_path(root, &meta.name), &out)
 }
 
 /// Parse a `depends:` field into plain package names, stripping any
@@ -690,7 +709,7 @@ fn parse_depends(depends: &str) -> Vec<String> {
 /// here).
 fn resolve_dependencies(depends: &str, root: &str, resolving: &mut Vec<String>) -> bool {
     for dep in parse_depends(depends) {
-        if is_installed(&dep) {
+        if is_installed(root, &dep) {
             continue;
         }
         if resolving.contains(&dep) {
@@ -789,7 +808,7 @@ fn fetch_and_install_inner(pkg: &str, root: &str, resolving: &mut Vec<String>) -
                 depends: String::new(),
                 description: String::new(),
             };
-            write_installed_record(&legacy_meta, &legacy_files);
+            write_installed_record(root, &legacy_meta, &legacy_files);
             println!("{GREEN}[spk] {pkg} installed.{R}");
             true
         }
@@ -810,52 +829,55 @@ fn cmd_install(pkg: &str) {
 }
 
 fn cmd_list() {
-    let names = list_installed_names();
+    let root = target_root();
+    let names = list_installed_names(root);
     if names.is_empty() {
         println!(
-            "{YELLOW}[spk] No packages installed (or {INSTALLED_DB_DIR} doesn't exist yet).{R}"
+            "{YELLOW}[spk] No packages installed (or {} doesn't exist yet).{R}",
+            installed_db_dir(root)
         );
         return;
     }
     println!("{BOLD}Installed packages ({}){R}", names.len());
     for name in &names {
-        if let Some(p) = read_installed(name) {
+        if let Some(p) = read_installed(root, name) {
             println!("  {GREEN}{}{R}  {}", p.name, p.version);
         }
     }
 }
 
 fn cmd_depends(name: &str) {
-    fn print_tree(name: &str, depth: usize, seen: &mut std::collections::HashSet<String>) {
+    fn print_tree(root: &str, name: &str, depth: usize, seen: &mut std::collections::HashSet<String>) {
         let indent = "  ".repeat(depth);
         if seen.contains(name) {
             println!("{indent}{YELLOW}{name} (already shown above -- shared dependency){R}");
             return;
         }
         seen.insert(name.to_string());
-        match read_installed(name) {
+        match read_installed(root, name) {
             Some(p) => {
                 println!("{indent}{GREEN}{}{R} {}", p.name, p.version);
                 for dep in parse_depends(&p.depends) {
-                    print_tree(&dep, depth + 1, seen);
+                    print_tree(root, &dep, depth + 1, seen);
                 }
             }
             None => println!("{indent}{RED}{name} (not installed){R}"),
         }
     }
+    let root = target_root();
     let mut seen = std::collections::HashSet::new();
-    print_tree(name, 0, &mut seen);
+    print_tree(root, name, 0, &mut seen);
 }
 
 /// Everything installed that declares `name` in its own `depends:` --
 /// i.e. what breaks if `name` is removed. Used by cmd_remove's
 /// reverse-dependency check.
-fn find_dependents(name: &str) -> Vec<String> {
-    list_installed_names()
+fn find_dependents(root: &str, name: &str) -> Vec<String> {
+    list_installed_names(root)
         .into_iter()
         .filter(|other| other != name)
         .filter(|other| {
-            read_installed(other)
+            read_installed(root, other)
                 .map(|p| parse_depends(&p.depends).iter().any(|d| d == name))
                 .unwrap_or(false)
         })
@@ -863,18 +885,19 @@ fn find_dependents(name: &str) -> Vec<String> {
 }
 
 fn cmd_remove(name: &str, force: bool, yes: bool) {
-    let pkg = match read_installed(name) {
+    let root = target_root();
+    let pkg = match read_installed(root, name) {
         Some(p) => p,
         None => {
             println!(
                 "{RED}[spk] '{name}' is not installed (no record at {}).{R}",
-                installed_db_path(name)
+                installed_db_path(root, name)
             );
             exit(1);
         }
     };
 
-    let dependents = find_dependents(name);
+    let dependents = find_dependents(root, name);
     if !dependents.is_empty() {
         if !force {
             println!(
@@ -897,11 +920,11 @@ fn cmd_remove(name: &str, force: bool, yes: bool) {
     // fresh against every other installed record here rather than
     // trusted from anywhere else.
     let mut other_owned: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for other in list_installed_names() {
+    for other in list_installed_names(root) {
         if other == name {
             continue;
         }
-        if let Some(p) = read_installed(&other) {
+        if let Some(p) = read_installed(root, &other) {
             other_owned.extend(p.files);
         }
     }
@@ -928,7 +951,7 @@ fn cmd_remove(name: &str, force: bool, yes: bool) {
         }
     }
 
-    let prerm_path = format!("{}.prerm", installed_db_path(name));
+    let prerm_path = format!("{}.prerm", installed_db_path(root, name));
     if Path::new(&prerm_path).exists() {
         let _ = Command::new("chmod").args(["+x", &prerm_path]).status();
         match Command::new("sh").arg(&prerm_path).status() {
@@ -937,13 +960,12 @@ fn cmd_remove(name: &str, force: bool, yes: bool) {
         }
     }
 
-    let root = target_root();
     for f in &to_delete {
         let path = format!("{}/{}", root.trim_end_matches('/'), f);
         remove_root_file(&path);
     }
 
-    let postrm_path = format!("{}.postrm", installed_db_path(name));
+    let postrm_path = format!("{}.postrm", installed_db_path(root, name));
     if Path::new(&postrm_path).exists() {
         let _ = Command::new("chmod").args(["+x", &postrm_path]).status();
         match Command::new("sh").arg(&postrm_path).status() {
@@ -954,7 +976,7 @@ fn cmd_remove(name: &str, force: bool, yes: bool) {
 
     remove_root_file(&prerm_path);
     remove_root_file(&postrm_path);
-    remove_root_file(&installed_db_path(name));
+    remove_root_file(&installed_db_path(root, name));
     println!("{GREEN}[spk] {} removed.{R}", pkg.name);
 }
 
@@ -1078,6 +1100,170 @@ fn cmd_system_upgrade() {
     } else {
         println!("{YELLOW}{BOLD}[spk] Upgrade complete with failures: {failures:?}{R}");
         exit(1);
+    }
+}
+
+// ── create-live-image ──────────────────────────────────────────────────────────
+//
+// Assembles a bootable image straight from packages already sitting on a
+// repo, instead of spk-compile.py's from-source build. Needs a repo to
+// publish index.txt (see phase_bundle_spkg_packages) -- one "name
+// version" pair per line -- so spk can discover what's available without
+// anything hardcoded into this binary.
+//
+// Honest current limitation: kernel, firmware, GRUB, and the live
+// initramfs aren't published as .spkg packages yet (only KF6/Plasma/Qt6
+// modules are, as of this writing -- see phase_bundle_spkg_packages's own
+// docstring). This still produces a real squashfs of everything the repo
+// actually has; it only produces a bootable ISO on top of that if
+// packages providing /boot/vmlinuz, /boot/live-initrd.img, and a real
+// grub-mkrescue end up in the installed set. That's not a bug in this
+// command -- it's an accurate reflection of what's published today.
+
+fn fetch_repo_index() -> Option<(String, Vec<String>)> {
+    for repo in load_repos() {
+        let idx_tmp = format!("/tmp/spk-index-{}.txt", std::process::id());
+        let url = format!("{}/index.txt", repo.url.trim_end_matches('/'));
+        let ok = Command::new("curl")
+            .args(["-sfL", "-o", &idx_tmp, &url])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !ok {
+            let _ = fs::remove_file(&idx_tmp);
+            continue;
+        }
+        let names: Vec<String> = fs::read_to_string(&idx_tmp)
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|l| l.split_whitespace().next())
+            .map(|s| s.to_string())
+            .collect();
+        let _ = fs::remove_file(&idx_tmp);
+        if !names.is_empty() {
+            return Some((repo.name.clone(), names));
+        }
+    }
+    None
+}
+
+fn cmd_create_live_image(out_iso: &str, extra_names: &[String]) {
+    let mut names: Vec<String> = Vec::new();
+    match fetch_repo_index() {
+        Some((repo_name, index_names)) => {
+            println!(
+                "{GREEN}[spk] Using package index from repo '{repo_name}' ({} packages).{R}",
+                index_names.len()
+            );
+            names = index_names;
+        }
+        None => {
+            println!(
+                "{YELLOW}[spk] No configured repo has an index.txt.{R}"
+            );
+        }
+    }
+    for n in extra_names {
+        if !names.contains(n) {
+            names.push(n.clone());
+        }
+    }
+    if names.is_empty() {
+        println!("{RED}[spk] No packages to install -- no repo index found and no extra package names given.{R}");
+        println!("  Usage: spk create-live-image <output.iso> [extra-package-name...]");
+        exit(1);
+    }
+
+    let scratch = format!("/tmp/spk-live-image-root-{}", std::process::id());
+    let _ = fs::remove_dir_all(&scratch);
+    if fs::create_dir_all(&scratch).is_err() {
+        println!("{RED}[spk] Failed to create scratch root {scratch}.{R}");
+        exit(1);
+    }
+
+    println!("{BOLD}[spk] Installing {} package(s) into {scratch}...{R}", names.len());
+    let mut failures = Vec::new();
+    for (i, name) in names.iter().enumerate() {
+        println!("{BOLD}[{}/{}] {name}{R}", i + 1, names.len());
+        // Dependency resolution and the installed-db it consults are
+        // both scoped to `scratch` (see installed_db_dir), so the
+        // resulting image itself boots with a real, working spk
+        // database -- not just the files, the package metadata too.
+        if !fetch_and_install_inner(name, &scratch, &mut Vec::new()) {
+            failures.push(name.clone());
+        }
+    }
+    if !failures.is_empty() {
+        println!(
+            "{YELLOW}[spk] {} package(s) failed to install: {}{R}",
+            failures.len(),
+            failures.join(", ")
+        );
+    }
+
+    let vmlinuz = format!("{scratch}/boot/vmlinuz");
+    let initrd = format!("{scratch}/boot/live-initrd.img");
+    let have_boot = Path::new(&vmlinuz).exists() && Path::new(&initrd).exists();
+    if !have_boot {
+        println!(
+            "{YELLOW}[spk] {scratch}/boot/vmlinuz and/or live-initrd.img are not present in \
+             the installed package set -- kernel/firmware/live-initramfs aren't published as \
+             .spkg packages yet. Producing the squashfs only, not a bootable ISO.{R}"
+        );
+    }
+
+    let squashfs_path = format!("{scratch}.squashfs");
+    println!("{CYAN}[spk] Building squashfs...{R}");
+    let squash_ok = Command::new("mksquashfs")
+        .args([scratch.as_str(), squashfs_path.as_str(), "-comp", "xz",
+               "-e", &format!("{scratch}/boot"), "-noappend"])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !squash_ok {
+        println!("{RED}[spk] mksquashfs failed.{R}");
+        exit(1);
+    }
+    println!("{GREEN}[spk] squashfs: {squashfs_path}{R}");
+
+    if have_boot {
+        let iso_root = format!("{scratch}-iso-root");
+        let _ = fs::remove_dir_all(&iso_root);
+        let _ = fs::create_dir_all(format!("{iso_root}/boot/grub"));
+        let _ = fs::create_dir_all(format!("{iso_root}/live"));
+        let _ = fs::copy(&vmlinuz, format!("{iso_root}/boot/vmlinuz"));
+        let _ = fs::copy(&initrd, format!("{iso_root}/boot/live-initrd.img"));
+        let _ = fs::rename(&squashfs_path, format!("{iso_root}/live/filesystem.squashfs"));
+        let grub_cfg = "set timeout=10\nset default=0\n\n\
+            menuentry \"SmechOS (from repo image)\" {\n\
+            \x20\x20\x20\x20linux  /boot/vmlinuz boot=live quiet splash loglevel=3\n\
+            \x20\x20\x20\x20initrd /boot/live-initrd.img\n}\n";
+        let _ = fs::write(format!("{iso_root}/boot/grub/grub.cfg"), grub_cfg);
+
+        let grub_mkrescue = format!("{scratch}/usr/bin/grub-mkrescue");
+        let mkrescue_bin = if Path::new(&grub_mkrescue).exists() {
+            grub_mkrescue
+        } else {
+            "grub-mkrescue".to_string()
+        };
+        println!("{CYAN}[spk] Building ISO with {mkrescue_bin}...{R}");
+        let iso_ok = Command::new(&mkrescue_bin)
+            .args(["-o", out_iso, &iso_root, "--", "-volid", "SMECHOS_LIVE"])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        let _ = fs::remove_dir_all(&iso_root);
+        if iso_ok {
+            println!("{GREEN}{BOLD}[spk] Bootable image: {out_iso}{R}");
+        } else {
+            println!("{RED}[spk] grub-mkrescue failed -- squashfs was still produced at {squashfs_path} before this step moved it into the ISO root.{R}");
+            exit(1);
+        }
+    } else {
+        println!(
+            "{YELLOW}[spk] Done, but no ISO was produced (see above). \
+             Publish kernel/live-initramfs/grub as .spkg packages to close this gap.{R}"
+        );
     }
 }
 
@@ -1485,6 +1671,17 @@ fn main() {
                 exit(1);
             }
             cmd_depends(&args[2]);
+        }
+
+        "create-live-image" => {
+            if args.len() < 3 {
+                println!(
+                    "{RED}[spk] Error: specify an output path.   \
+                     spk create-live-image <output.iso> [extra-package-name...]{R}"
+                );
+                exit(1);
+            }
+            cmd_create_live_image(&args[2], &args[3..]);
         }
 
         "system-upgrade" => cmd_system_upgrade(),
