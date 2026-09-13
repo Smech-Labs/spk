@@ -24,10 +24,23 @@ spk create-live-image <out.iso>      Build a bootable image straight from a repo
                                       published packages, not from source (needs a
                                       repo with index.txt)
 spk system-upgrade                   Re-fetch and reinstall every known SmechOS package
-spk compile ...                      Forward to spk-compile.py (build orchestration)
+spk compile <recipe> [-o out.spkg]   Build ONE package's source into a .spkg (pure Rust,
+                                      no spk-compile.py involved -- see "spk compile" below)
+spk build-image ...                  Forward to spk-compile.py (whole-image build
+                                      orchestration -- an entire SmechOS/SmechVisor ISO
+                                      from source, not a single package)
 spk about                            Show version/credits
 spk help                             Show usage
 ```
+
+`compile` used to mean "forward to spk-compile.py" (v2.4.0 and earlier). That
+was a naming collision: in a package manager, "compile" should mean
+"turn one package's source into a package," not "build an entire OS
+image" -- an orchestration job that already has its own huge, separate
+tool (`spk-compile.py`). `build-image` is the new name for that old
+behavior; `compile` is now the real thing. If you're looking for the
+former `spk compile smechos` / `spk compile iso smechos` / etc., that's
+`spk build-image smechos` / `spk build-image iso smechos` now.
 
 `system-install`/`userland-install`/`entire-system-upgrade` still work as
 deprecated aliases for `install`/`system-upgrade` (v1.x compat), printing
@@ -61,6 +74,55 @@ description: KDE Frameworks - KCoreAddons module
 priority order, falling back to the legacy bare `<name>.tar.xz` only if
 no repo has a `.spkg` for it -- existing repos don't break outright
 during the migration off the old bundle format.
+
+## `spk compile`: building a `.spkg` from source
+
+```
+spk compile <recipe> [-o out.spkg]
+```
+
+Run from inside an already-extracted (or already-cloned) source tree.
+A recipe is the same `control` header as above, followed by one or more
+`#--<section>--`-marked shell script blocks -- `build` and `install` are
+required, `preinst`/`postinst`/`prerm`/`postrm` are optional and become
+the package's hook scripts:
+
+```
+name: hello-spk
+version: 1.0.0
+architecture: x86_64
+depends:
+description: Example package
+
+#--build--
+cc -O2 -o hello main.c
+
+#--install--
+mkdir -p "$SPK_STAGE/usr/bin"
+cp hello "$SPK_STAGE/usr/bin/hello"
+
+#--postinst--
+echo "hello-spk installed"
+```
+
+Header lines are parsed the same way the `.spkg` `control` file is
+-- but only the header, up to the first `#--section--` marker. Script
+content is never scanned for `key:` pairs, so a build command with a
+literal colon in it (`echo "note: ..."`) can't be misread as metadata.
+
+`build` runs in the current directory with no special environment.
+`install` runs with `$SPK_STAGE` set to a fresh staging directory --
+stage files there exactly as they should land relative to the install
+root (`$SPK_STAGE/usr/bin/hello`, not `$SPK_STAGE/hello`). Whatever ends
+up under `$SPK_STAGE` becomes `data.tar.xz`; the header plus any hook
+scripts become `control.tar.xz`. Output defaults to
+`<name>-<version>.spkg` in the current directory, or wherever `-o`
+points.
+
+This is pure Rust -- no Python, no `spk-compile.py` involved. It's a
+different job by an order of magnitude: `spk compile` builds one
+package; `spk build-image` (below) builds an entire SmechOS/SmechVisor
+image, hundreds of phases, hours long. Don't confuse the two.
 
 ### Why `--local-package` is required, not auto-detected
 

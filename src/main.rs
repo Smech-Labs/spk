@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::env;
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write as IoWrite};
@@ -16,7 +17,7 @@ const RED: &str = "\x1b[31m";
 const MAGENTA: &str = "\x1b[35m";
 
 // ── Config ────────────────────────────────────────────────────────────────────
-const VERSION: &str = "2.4.0";
+const VERSION: &str = "2.5.0";
 // Fallback used only if /etc/spk-repo-conf.yaml is missing or fails to parse
 // (e.g. a system that predates this file, or one where it was deleted).
 const DEFAULT_RELEASE_URL: &str =
@@ -247,16 +248,21 @@ fn print_help() {
     println!("                                     with index.txt -- see phase_bundle_spkg_packages)");
     println!("    {GREEN}system-upgrade{R}             Re-fetch and reinstall all known packages");
     println!();
-    println!("{BOLD}BUILD (native orchestration via spk-compile.py){R}");
-    println!("    {GREEN}compile smechos{R}            Full SmechOS build");
-    println!("    {GREEN}compile smechvisor{R}         Full SmechVisor build");
-    println!("    {GREEN}compile smechos  --phase <p>{R}  Single SmechOS phase");
-    println!("    {GREEN}compile smechvisor --phase <p>{R} Single SmechVisor phase");
-    println!("    {GREEN}compile iso smechos{R}        SmechOS install ISO");
-    println!("    {GREEN}compile iso smechvisor{R}     SmechVisor install ISO");
-    println!("    {GREEN}compile iso shim{R}           SmechVisor deploy shim ISO");
-    println!("    {GREEN}compile --list smechos{R}     List SmechOS build phases");
-    println!("    {GREEN}compile --list smechvisor{R}  List SmechVisor build phases");
+    println!("{BOLD}PACKAGE BUILD (pure Rust, no spk-compile.py involved){R}");
+    println!("    {GREEN}compile <recipe> [-o out.spkg]{R}  Build ONE package's source into a");
+    println!("                                     .spkg (recipe = control-style header +");
+    println!("                                     #--build--/#--install-- script blocks)");
+    println!();
+    println!("{BOLD}IMAGE BUILD (native orchestration via spk-compile.py){R}");
+    println!("    {GREEN}build-image smechos{R}        Full SmechOS build");
+    println!("    {GREEN}build-image smechvisor{R}     Full SmechVisor build");
+    println!("    {GREEN}build-image smechos  --phase <p>{R}  Single SmechOS phase");
+    println!("    {GREEN}build-image smechvisor --phase <p>{R} Single SmechVisor phase");
+    println!("    {GREEN}build-image iso smechos{R}    SmechOS install ISO");
+    println!("    {GREEN}build-image iso smechvisor{R} SmechVisor install ISO");
+    println!("    {GREEN}build-image iso shim{R}       SmechVisor deploy shim ISO");
+    println!("    {GREEN}build-image --list smechos{R} List SmechOS build phases");
+    println!("    {GREEN}build-image --list smechvisor{R} List SmechVisor build phases");
     println!();
     println!("{BOLD}SMECHVISOR NETWORK DEPLOY{R}");
     println!("    {GREEN}deploy-system-img-copy <code>{R}  Push SmechVisor to a shim node");
@@ -501,7 +507,12 @@ fn install_spkg_file_inner(spkg_path: &str, root: &str, resolving: &mut Vec<Stri
             // A package uninstall here never touches directories, only
             // the regular files/symlinks it actually owns.
             .filter(|l| !l.trim().is_empty() && *l != "." && !l.ends_with('/'))
-            .map(|l| l.to_string())
+            // A data.tar.xz built by archiving "." (as `spk compile` does)
+            // lists members as "./usr/bin/foo"; one built from an explicit
+            // file list has no such prefix. Normalize both to the same
+            // form so `remove`'s shared-file check compares equal paths
+            // regardless of which tool produced the .spkg.
+            .map(|l| l.trim_start_matches("./").to_string())
             .collect();
         if !write_installed_record(root, &meta, &files) {
             println!(
@@ -784,7 +795,7 @@ fn fetch_and_install_inner(pkg: &str, root: &str, resolving: &mut Vec<String>) -
         // Directories excluded outright, not just slash-stripped -- see
         // the .spkg path's identical filter above for why.
         .filter(|l| !l.trim().is_empty() && *l != "." && !l.ends_with('/'))
-        .map(|l| l.to_string())
+        .map(|l| l.trim_start_matches("./").to_string())
         .collect();
 
     println!("{CYAN}[spk] Extracting {pkg} into {root}...{R}");
@@ -1283,7 +1294,7 @@ fn find_spk_compile() -> Option<String> {
     None
 }
 
-fn cmd_compile(args: &[String]) {
+fn cmd_build_image(args: &[String]) {
     let script = match find_spk_compile() {
         Some(s) => s,
         None => {
@@ -1308,6 +1319,189 @@ fn cmd_compile(args: &[String]) {
             exit(1);
         }
     }
+}
+
+// ── spk compile: build ONE package's source into a .spkg ────────────────────
+//
+// Not to be confused with `spk build-image`, which forwards to
+// spk-compile.py to build an entire SmechOS/SmechVisor image from source --
+// a different job by an order of magnitude. `compile` here is the verb a
+// package manager actually owns: take a recipe describing how to build and
+// stage one component, run it, and package the result. Pure Rust, no
+// spk-compile.py involved -- same "shell out to real build tools, don't
+// link crates for it" philosophy as the rest of spk.
+
+/// A recipe is the same key:value header as a .spkg control file, followed
+/// by one or more `#--<section>--` marked shell script blocks. Header lines
+/// are parsed with `parse_control`; script content is never scanned for
+/// `key:` pairs, so a build command containing a literal colon can't be
+/// misread as metadata.
+fn parse_recipe(text: &str) -> (ControlMeta, HashMap<String, String>) {
+    let mut header = String::new();
+    let mut sections: HashMap<String, String> = HashMap::new();
+    let mut current: Option<String> = None;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("#--") && trimmed.ends_with("--") && trimmed.len() > 5 {
+            let name = trimmed[3..trimmed.len() - 2].trim().to_lowercase();
+            current = Some(name.clone());
+            sections.entry(name).or_default();
+            continue;
+        }
+        match &current {
+            Some(name) => {
+                let buf = sections.get_mut(name).unwrap();
+                buf.push_str(line);
+                buf.push('\n');
+            }
+            None => {
+                header.push_str(line);
+                header.push('\n');
+            }
+        }
+    }
+    (parse_control(&header), sections)
+}
+
+fn write_script(dir: &str, name: &str, content: &str) -> String {
+    let path = format!("{dir}/{name}");
+    let _ = fs::write(&path, content);
+    let _ = Command::new("chmod").args(["+x", &path]).status();
+    path
+}
+
+fn cmd_compile_package(recipe_path: &str, out_override: Option<&str>) {
+    let text = match fs::read_to_string(recipe_path) {
+        Ok(t) => t,
+        Err(e) => {
+            println!("{RED}[spk] Failed to read recipe {recipe_path}: {e}{R}");
+            exit(1);
+        }
+    };
+    let (mut meta, sections) = parse_recipe(&text);
+    if meta.name.is_empty() || meta.version.is_empty() {
+        println!("{RED}[spk] Recipe is missing 'name' or 'version' in its header.{R}");
+        exit(1);
+    }
+    if meta.architecture.is_empty() {
+        meta.architecture = "x86_64".to_string();
+    }
+    let build_script = sections.get("build").map(|s| s.trim()).unwrap_or("");
+    let install_script = sections.get("install").map(|s| s.trim()).unwrap_or("");
+    if build_script.is_empty() || install_script.is_empty() {
+        println!(
+            "{RED}[spk] Recipe needs both a #--build-- and a #--install-- section.{R}"
+        );
+        exit(1);
+    }
+
+    static BUILD_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let build_id = BUILD_COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let build_root = format!(
+        "/tmp/spk-compile-{}-{}-{}",
+        meta.name,
+        std::process::id(),
+        build_id
+    );
+    let control_dir = format!("{build_root}/control");
+    let stage_dir = format!("{build_root}/stage");
+    let _ = fs::remove_dir_all(&build_root);
+    if fs::create_dir_all(&control_dir).is_err() || fs::create_dir_all(&stage_dir).is_err() {
+        println!("{RED}[spk] Failed to create build dir {build_root}.{R}");
+        exit(1);
+    }
+
+    println!(
+        "{CYAN}[spk] Building {} {}...{R}",
+        meta.name, meta.version
+    );
+    let build_sh = write_script(&build_root, "build.sh", build_script);
+    let build_ok = Command::new("sh")
+        .arg(&build_sh)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !build_ok {
+        println!("{RED}[spk] Build step failed for {}.{R}", meta.name);
+        println!("  (left for inspection: {build_root})");
+        exit(1);
+    }
+
+    println!("{CYAN}[spk] Staging install into {stage_dir}...{R}");
+    let install_sh = write_script(&build_root, "install.sh", install_script);
+    let install_ok = Command::new("sh")
+        .arg(&install_sh)
+        .env("SPK_STAGE", &stage_dir)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !install_ok {
+        println!("{RED}[spk] Install step failed for {}.{R}", meta.name);
+        println!("  (left for inspection: {build_root})");
+        exit(1);
+    }
+    let staged_anything = fs::read_dir(&stage_dir)
+        .map(|mut d| d.next().is_some())
+        .unwrap_or(false);
+    if !staged_anything {
+        println!(
+            "{RED}[spk] Install step produced no files under $SPK_STAGE ({stage_dir}).{R}"
+        );
+        println!("  Nothing to package -- check the #--install-- section.");
+        exit(1);
+    }
+
+    let control_text = format!(
+        "name: {}\nversion: {}\narchitecture: {}\ndepends: {}\ndescription: {}\n",
+        meta.name, meta.version, meta.architecture, meta.depends, meta.description
+    );
+    let _ = fs::write(format!("{control_dir}/control"), control_text);
+    for hook in ["preinst", "postinst", "prerm", "postrm"] {
+        if let Some(script) = sections.get(hook) {
+            if !script.trim().is_empty() {
+                write_script(&control_dir, hook, script);
+            }
+        }
+    }
+
+    let control_tar = format!("{build_root}/control.tar.xz");
+    let data_tar = format!("{build_root}/data.tar.xz");
+    let control_tar_ok = Command::new("tar")
+        .args(["-cJf", &control_tar, "-C", &control_dir, "."])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    let data_tar_ok = Command::new("tar")
+        .args(["-cJf", &data_tar, "-C", &stage_dir, "."])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !control_tar_ok || !data_tar_ok {
+        println!("{RED}[spk] Failed to build control.tar.xz/data.tar.xz for {}.{R}", meta.name);
+        exit(1);
+    }
+
+    let out_path = out_override
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| format!("{}-{}.spkg", meta.name, meta.version));
+    let outer_ok = Command::new("tar")
+        .args([
+            "-cf",
+            &out_path,
+            "-C",
+            &build_root,
+            "control.tar.xz",
+            "data.tar.xz",
+        ])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    let _ = fs::remove_dir_all(&build_root);
+    if !outer_ok {
+        println!("{RED}[spk] Failed to assemble {out_path}.{R}");
+        exit(1);
+    }
+    println!("{GREEN}[spk] Built {out_path}{R}");
 }
 
 // ── Deploy (SmechVisor network deploy) ───────────────────────────────────────
@@ -1687,8 +1881,35 @@ fn main() {
         "system-upgrade" => cmd_system_upgrade(),
 
         "compile" => {
-            // Forward everything after "compile" to spk-compile.py
-            cmd_compile(&args[2..].to_vec());
+            let rest = &args[2..];
+            if rest.is_empty() {
+                println!(
+                    "{RED}[spk] Error: specify a recipe.   spk compile <recipe> [-o out.spkg]{R}"
+                );
+                exit(1);
+            }
+            let out = rest
+                .iter()
+                .position(|a| a == "-o" || a == "--output")
+                .and_then(|i| rest.get(i + 1))
+                .map(|s| s.as_str());
+            let recipe = match rest.iter().find(|a| !a.starts_with('-')) {
+                Some(r) => r,
+                None => {
+                    println!(
+                        "{RED}[spk] Error: specify a recipe.   spk compile <recipe> [-o out.spkg]{R}"
+                    );
+                    exit(1);
+                }
+            };
+            cmd_compile_package(recipe, out);
+        }
+
+        "build-image" => {
+            // Forward everything after "build-image" to spk-compile.py --
+            // this is the whole-image, from-source build orchestrator, not
+            // a single package. See `compile` above for that.
+            cmd_build_image(&args[2..].to_vec());
         }
 
         "deploy-system-img-copy" => {
