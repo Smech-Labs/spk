@@ -1,0 +1,34 @@
+name: DCO
+
+on:
+  pull_request:
+
+jobs:
+  check-signoff:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Verify every commit in this PR is signed off
+        run: |
+          set -euo pipefail
+          base="${{ github.event.pull_request.base.sha }}"
+          head="${{ github.event.pull_request.head.sha }}"
+          missing=0
+          for sha in $(git rev-list "$base..$head"); do
+            msg="$(git log -1 --format=%B "$sha")"
+            email="$(git log -1 --format=%ae "$sha")"
+            if ! printf '%s\n' "$msg" | grep -qiE "^Signed-off-by: .+ <${email//./\\.}>$"; then
+              echo "::error::Commit $sha is missing a matching 'Signed-off-by:' trailer for $email."
+              missing=1
+            fi
+          done
+          if [ "$missing" -ne 0 ]; then
+            echo
+            echo "Every commit must be signed off per the Developer Certificate of Origin (see DCO.md)."
+            echo "Fix with: git commit --amend -s   (for the last commit), or"
+            echo "          git rebase --signoff <base>   (to sign off a whole range)"
+            exit 1
+          fi

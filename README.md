@@ -27,8 +27,8 @@ spk system-upgrade                   Re-fetch and reinstall every known SmechOS 
 spk compile <recipe> [-o out.spkg]   Build ONE package's source into a .spkg (pure Rust,
                                       no spk-compile.py involved -- see "spk compile" below)
 spk build-image ...                  Forward to spk-compile.py (whole-image build
-                                      orchestration -- an entire SmechOS/SmechVisor ISO
-                                      from source, not a single package)
+                                      orchestration -- an entire SmechOS ISO from
+                                      source, not a single package)
 spk about                            Show version/credits
 spk help                             Show usage
 ```
@@ -58,9 +58,11 @@ foo-1.2.3.spkg
 └── data.tar.xz       payload -- paths relative to the install root
 ```
 
-`control` file schema (same hand-parsed `key: value` style as
-`spk-repo-conf.yaml` below -- `spk` has zero crate dependencies, so
-there's no YAML/JSON parser to reach for):
+`control` file schema (deliberately its own flat `key: value` format,
+not YAML -- unlike `spk-repo-conf.yaml` below, which *is* real YAML, this
+one stays hand-parsed on purpose: the schema is small, fixed, and
+entirely spk's own, so there's no reason to drag a YAML parser through
+every `.spkg` build and install just to read five known keys):
 
 ```
 name: kcoreaddons
@@ -121,8 +123,8 @@ points.
 
 This is pure Rust -- no Python, no `spk-compile.py` involved. It's a
 different job by an order of magnitude: `spk compile` builds one
-package; `spk build-image` (below) builds an entire SmechOS/SmechVisor
-image, hundreds of phases, hours long. Don't confuse the two.
+package; `spk build-image` (below) builds an entire SmechOS image,
+hundreds of phases, hours long. Don't confuse the two.
 
 ### Why `--local-package` is required, not auto-detected
 
@@ -201,10 +203,11 @@ something a repo actually publishes.
 ## Build requirements
 
 - Rust + Cargo (any recent stable toolchain)
-- **Zero crate dependencies** -- `Cargo.toml` has an empty `[dependencies]`
-  section by design. `spk` is a small, fully static-logic binary; it shells
-  out to system tools for everything external rather than linking against
-  HTTP/TLS/archive crates.
+- **Minimal crate dependencies** -- `Cargo.toml` pulls in `yaml-rust2` for
+  real YAML parsing (`/etc/spk-repo-conf.yaml`) and nothing else. `spk` is
+  still a small, mostly static-logic binary; it shells out to system tools
+  for everything external (HTTP, TLS, archives) rather than linking against
+  crates for those.
 
 ```sh
 cargo build --release
@@ -286,3 +289,8 @@ via its REST file-content API. Both of these were removed:
   correct size (just separately corrupted at the source, an unrelated
   problem). The REST API is built for reviewing source diffs, not serving
   large binaries reliably. GitHub Releases has no such limit.
+
+## License
+
+MIT, see [LICENSE](LICENSE). Contributions require a DCO sign-off --
+see [CONTRIBUTING.md](CONTRIBUTING.md).
