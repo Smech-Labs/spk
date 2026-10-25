@@ -6,3 +6,4 @@ license = "MIT"
 repository = "https://github.com/Smech-Labs/spk"
 
 [dependencies]
+yaml-rust2 = { version = "0.13", default-features = false }

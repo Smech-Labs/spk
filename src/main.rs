@@ -1,11 +1,12 @@
+mod resolver;
+
 use std::collections::HashMap;
 use std::env;
 use std::fs;
-use std::io::{BufRead, BufReader, Read, Write as IoWrite};
-use std::net::{TcpListener, UdpSocket};
+use std::io::{BufRead, BufReader, Write as IoWrite};
 use std::path::Path;
 use std::process::{Command, Stdio, exit};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use yaml_rust2::YamlLoader;
 
 // ── ANSI ─────────────────────────────────────────────────────────────────────
 const R: &str = "\x1b[0m";
@@ -26,13 +27,21 @@ const REPO_CONF_PATH: &str = "/etc/spk-repo-conf.yaml";
 const DOCS_URL: &str = "https://docs.smech.xyz";
 // One text file per installed package -- see InstalledPkg below for format.
 const INSTALLED_DB_DIR: &str = "/var/lib/spk/installed";
+// The public half of nix2spk's signing key (see keys/nix2spk-signing.key,
+// never committed). Every ~nix~ package must carry a `signature` file in
+// its control.tar.xz that verifies against this key over the canonical
+// message (see verify_signature/signing_message_for) -- otherwise it's
+// refused, closing the suffix-spoofing hole a crafted control file with a
+// fake ~nix~ name and an arbitrary payload used to walk straight through.
+const NIX2SPK_PUBKEY: &str = "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEA/B2iaPNEITKzbMvMd5PXD9Tjxv3dXLd5NaNvIvnNIHE=\n-----END PUBLIC KEY-----\n";
 
 // ── Repo config ───────────────────────────────────────────────────────────────
 // /etc/spk-repo-conf.yaml lets an operator point spk at one or more package
-// repos without hardcoding a URL into the binary. Deliberately hand-parsed
-// rather than pulling in a YAML crate -- spk is a zero-dependency binary by
-// design (see Cargo.toml), and the schema this file actually needs is small
-// and fixed enough that a general-purpose parser isn't worth that tradeoff.
+// repos without hardcoding a URL into the binary. Parsed with yaml-rust2 (spk
+// is no longer a zero-dependency binary, see Cargo.toml) rather than the
+// previous hand-rolled line-by-line parser, which only ever approximated a
+// small fixed subset of real YAML and would have silently misread anything
+// outside it (multi-line strings, flow-style lists/maps, anchors, etc.).
 //
 // Priority: 1 is tried first, up to 99 for ordinary lower-priority mirrors.
 // 100 is a distinct "insecure/untrusted" tier, not just "even lower
@@ -56,79 +65,35 @@ fn default_repos() -> Vec<Repo> {
 }
 
 fn parse_repo_conf(text: &str) -> Vec<Repo> {
+    let docs = match YamlLoader::load_from_str(text) {
+        Ok(d) => d,
+        Err(_) => return Vec::new(),
+    };
+    let Some(doc) = docs.first() else { return Vec::new() };
+    let Some(entries) = doc["repos"].as_vec() else { return Vec::new() };
+
     let mut repos = Vec::new();
-    let mut cur_name: Option<String> = None;
-    let mut cur_url: Option<String> = None;
-    let mut cur_priority: Option<u8> = None;
-    let mut in_repos_list = false;
-
-    fn flush(
-        repos: &mut Vec<Repo>,
-        name: &mut Option<String>,
-        url: &mut Option<String>,
-        priority: &mut Option<u8>,
-    ) {
-        if let (Some(n), Some(u)) = (name.take(), url.take()) {
-            repos.push(Repo {
-                name: n,
-                url: u,
-                priority: priority.take().unwrap_or(50),
-            });
-        } else {
-            *priority = None;
-        }
-    }
-
-    fn unquote(s: &str) -> String {
-        let s = s.trim();
-        let s = s.strip_prefix('"').and_then(|s| s.strip_suffix('"')).unwrap_or(s);
-        let s = s.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')).unwrap_or(s);
-        s.to_string()
-    }
-
-    for raw_line in text.lines() {
-        let line = raw_line.split('#').next().unwrap_or("");
-        if line.trim().is_empty() {
+    for entry in entries {
+        let (Some(name), Some(url)) = (entry["name"].as_str(), entry["url"].as_str()) else {
             continue;
-        }
-        let trimmed = line.trim_start();
-
-        if !in_repos_list {
-            if trimmed.starts_with("repos:") {
-                in_repos_list = true;
-            }
-            continue;
-        }
-
-        if trimmed.starts_with("- ") || trimmed == "-" {
-            flush(&mut repos, &mut cur_name, &mut cur_url, &mut cur_priority);
-            let rest = trimmed.trim_start_matches('-').trim_start();
-            if let Some((k, v)) = rest.split_once(':') {
-                match k.trim() {
-                    "name" => cur_name = Some(unquote(v)),
-                    "url" => cur_url = Some(unquote(v)),
-                    "priority" => cur_priority = v.trim().parse().ok(),
-                    _ => {}
-                }
-            }
-            continue;
-        }
-
-        if let Some((k, v)) = trimmed.split_once(':') {
-            match k.trim() {
-                "name" => cur_name = Some(unquote(v)),
-                "url" => cur_url = Some(unquote(v)),
-                "priority" => cur_priority = v.trim().parse().ok(),
-                _ => {}
-            }
-        }
+        };
+        let priority = entry["priority"]
+            .as_i64()
+            .and_then(|p| u8::try_from(p).ok())
+            .unwrap_or(50);
+        repos.push(Repo {
+            name: name.to_string(),
+            url: url.to_string(),
+            priority,
+        });
     }
-    flush(&mut repos, &mut cur_name, &mut cur_url, &mut cur_priority);
     repos
 }
 
 fn load_repos() -> Vec<Repo> {
-    match fs::read_to_string(REPO_CONF_PATH) {
+    // SPK_REPO_CONF points spk at another config file (testing, non-root use).
+    let conf_path = env::var("SPK_REPO_CONF").unwrap_or_else(|_| REPO_CONF_PATH.to_string());
+    match fs::read_to_string(&conf_path) {
         Ok(text) => {
             let mut repos = parse_repo_conf(&text);
             if repos.is_empty() {
@@ -176,14 +141,6 @@ fn fetch_package_ext(pkg: &str, ext: &str, dest_tmp: &str) -> bool {
     false
 }
 
-/// Legacy name/signature preserved for cmd_deploy_to, which always wants
-/// the raw .tar.xz bytes to stream verbatim over the SmechVisor deploy
-/// wire protocol -- that path predates .spkg and isn't part of this
-/// migration.
-fn fetch_package(pkg: &str, dest_tmp: &str) -> bool {
-    fetch_package_ext(pkg, "tar.xz", dest_tmp)
-}
-
 // Packages currently published in the release above. Used by system-upgrade to
 // know what to re-fetch; install can fetch any package name (unknown ones just
 // produce an HTTP 404 from curl).
@@ -203,16 +160,6 @@ const SMECHOS_PACKAGES: &[&str] = &[
     "plasma-discover",
     "packagekit-spk",
 ];
-
-const SMECHVISOR_PACKAGES: &[(&str, bool)] = &[
-    ("smechvisor-daemon", false), // live-swappable, no reboot needed
-    ("smechvisor-base", true),    // kernel/base: requires reboot
-];
-
-// Deploy shim wire protocol
-const SHIM_UDP_PORT: u16 = 9191;
-const SHIM_TCP_PORT: u16 = 9192;
-const BROADCAST_MAGIC: &str = "SMECHVISOR_SHIM";
 
 // ── Banner / help ─────────────────────────────────────────────────────────────
 
@@ -243,6 +190,9 @@ fn print_help() {
     println!("                                     installed package also owns)");
     println!("    {GREEN}list{R}                       Show all installed packages");
     println!("    {GREEN}depends <pkg>{R}              Show a package's dependency tree");
+    println!("    {GREEN}solve <pkg>{R}                Show what installing a package would do");
+    println!("                                     (versions, alternatives, conflicts) without");
+    println!("                                     installing; needs the repo's index.meta");
     println!("    {GREEN}create-live-image <out.iso>{R}  Build a bootable image straight from a");
     println!("                                     repo's published packages (needs a repo");
     println!("                                     with index.txt -- see phase_bundle_spkg_packages)");
@@ -255,18 +205,9 @@ fn print_help() {
     println!();
     println!("{BOLD}IMAGE BUILD (native orchestration via spk-compile.py){R}");
     println!("    {GREEN}build-image smechos{R}        Full SmechOS build");
-    println!("    {GREEN}build-image smechvisor{R}     Full SmechVisor build");
     println!("    {GREEN}build-image smechos  --phase <p>{R}  Single SmechOS phase");
-    println!("    {GREEN}build-image smechvisor --phase <p>{R} Single SmechVisor phase");
     println!("    {GREEN}build-image iso smechos{R}    SmechOS install ISO");
-    println!("    {GREEN}build-image iso smechvisor{R} SmechVisor install ISO");
-    println!("    {GREEN}build-image iso shim{R}       SmechVisor deploy shim ISO");
     println!("    {GREEN}build-image --list smechos{R} List SmechOS build phases");
-    println!("    {GREEN}build-image --list smechvisor{R} List SmechVisor build phases");
-    println!();
-    println!("{BOLD}SMECHVISOR NETWORK DEPLOY{R}");
-    println!("    {GREEN}deploy-system-img-copy <code>{R}  Push SmechVisor to a shim node");
-    println!("    {GREEN}receive-deploy{R}                 Receive a SmechVisor deploy (shim mode)");
     println!();
     println!("{BOLD}PACKAGEKIT BACKEND (called by PackageKit daemon -- not for manual use){R}");
     println!("    {GREEN}packagekit-backend{R}         Speak PackageKit script protocol on stdin/stdout");
@@ -296,8 +237,8 @@ fn print_about() {
     println!("  First release: 2026");
     println!();
     println!("{BOLD}About{R}");
-    println!("  Unified sovereign package keeper for SmechOS and SmechVisor.");
-    println!("  Zero external crate dependencies -- pure Rust std.");
+    println!("  Unified sovereign package keeper for SmechOS.");
+    println!("  Minimal dependencies: real YAML parsing (yaml-rust2), everything else is std.");
     println!("  PackageKit backend included: works with Plasma Discover and");
     println!("  any other PackageKit-aware frontend out of the box.");
     println!("  Build orchestration via spk-compile (Project SmechDeployV2).");
@@ -324,11 +265,6 @@ fn target_root() -> &'static str {
     }
 }
 
-fn is_smechvisor() -> bool {
-    Path::new("/usr/bin/smechvisord").exists()
-        || Path::new("/etc/smechvisor-release").exists()
-}
-
 // ── .spkg format ──────────────────────────────────────────────────────────────
 //
 // A .spkg is a plain (uncompressed) outer tar -- no point double-compressing
@@ -350,6 +286,8 @@ struct ControlMeta {
     architecture: String,
     depends: String,
     description: String,
+    provides: String,
+    conflicts: String,
 }
 
 fn parse_control(text: &str) -> ControlMeta {
@@ -359,6 +297,8 @@ fn parse_control(text: &str) -> ControlMeta {
         architecture: String::new(),
         depends: String::new(),
         description: String::new(),
+        provides: String::new(),
+        conflicts: String::new(),
     };
     for raw_line in text.lines() {
         let line = raw_line.split('#').next().unwrap_or("");
@@ -369,6 +309,8 @@ fn parse_control(text: &str) -> ControlMeta {
                 "version" => m.version = v,
                 "architecture" => m.architecture = v,
                 "depends" => m.depends = v,
+                "provides" => m.provides = v,
+                "conflicts" => m.conflicts = v,
                 "description" => m.description = v,
                 _ => {}
             }
@@ -387,6 +329,98 @@ fn run_hook_script(control_dir: &str, name: &str) {
         Ok(s) if s.success() => {}
         _ => println!("{YELLOW}[spk] Warning: {name} script did not exit cleanly.{R}"),
     }
+}
+
+/// The exact bytes a converter tool signs -- must stay byte-for-byte
+/// identical to nix2spk.py's/apt2spk.py's own copy of this format, since
+/// the signature only verifies if both sides built the same message.
+fn signing_message_for(name: &str, version: &str, arch: &str, data_sha256_hex: &str) -> Vec<u8> {
+    format!(
+        "spk-sig-v1\nname={name}\nversion={version}\narchitecture={arch}\nsha256={data_sha256_hex}\n"
+    )
+    .into_bytes()
+}
+
+/// sha256 of a file's raw bytes, as a lowercase hex string. Shells out to
+/// `openssl dgst` rather than adding a sha2 crate, for the same
+/// zero-new-dependency reason signing itself shells out to openssl.
+fn sha256_of_file(path: &str) -> Option<String> {
+    let out = Command::new("openssl")
+        .args(["dgst", "-sha256", "-r", path])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    // `openssl dgst -r` prints "<hex>  <path>" (or "<hex> *<path>").
+    String::from_utf8_lossy(&out.stdout)
+        .split_whitespace()
+        .next()
+        .map(|s| s.to_string())
+}
+
+/// Verify a base64-encoded raw Ed25519 signature over `message` against a
+/// PEM-encoded public key, by shelling out to `openssl pkeyutl -verify
+/// -rawin` (symmetric with how nix2spk.py/apt2spk.py sign: raw Ed25519
+/// needs no separate digest algorithm the way RSA/ECDSA do). All three
+/// inputs go through temp files since `openssl pkeyutl` takes files, not
+/// stdin, for -in/-sigfile/-pubin here.
+fn verify_signature(pubkey_pem: &str, message: &[u8], sig_b64: &str) -> bool {
+    let Ok(sig_bytes) = base64_decode(sig_b64) else { return false };
+    let stage_id = std::process::id();
+    let dir = format!("/tmp/spk-verify-{stage_id}-{}", std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0));
+    if fs::create_dir_all(&dir).is_err() {
+        return false;
+    }
+    let pub_path = format!("{dir}/pub.pem");
+    let msg_path = format!("{dir}/message");
+    let sig_path = format!("{dir}/sig.bin");
+    let ok = fs::write(&pub_path, pubkey_pem).is_ok()
+        && fs::write(&msg_path, message).is_ok()
+        && fs::write(&sig_path, &sig_bytes).is_ok();
+    let verified = ok
+        && Command::new("openssl")
+            .args([
+                "pkeyutl", "-verify", "-pubin", "-inkey", &pub_path,
+                "-rawin", "-in", &msg_path, "-sigfile", &sig_path,
+            ])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+    let _ = fs::remove_dir_all(&dir);
+    verified
+}
+
+/// Minimal standard-alphabet base64 decoder -- just enough to turn the
+/// signature file's base64 text back into raw bytes, without adding a
+/// base64 crate for one call site.
+fn base64_decode(s: &str) -> Result<Vec<u8>, ()> {
+    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let s = s.trim();
+    let mut table = [255u8; 256];
+    for (i, &c) in ALPHABET.iter().enumerate() {
+        table[c as usize] = i as u8;
+    }
+    let mut out = Vec::new();
+    let mut buf = 0u32;
+    let mut bits = 0u32;
+    for b in s.bytes() {
+        if b == b'=' {
+            break;
+        }
+        let v = table[b as usize];
+        if v == 255 {
+            continue; // skip whitespace/newlines
+        }
+        buf = (buf << 6) | v as u32;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((buf >> bits) as u8);
+        }
+    }
+    Ok(out)
 }
 
 /// Install a .spkg file already sitting on local disk into `root`. Used by
@@ -459,11 +493,101 @@ fn install_spkg_file_inner(spkg_path: &str, root: &str, resolving: &mut Vec<Stri
     if !meta.description.is_empty() {
         println!("  {}", meta.description);
     }
+
+    if is_apt_package(&meta.name) {
+        println!(
+            "{RED}[spk] Refusing to install {}: '~apt~' packages are apt2spk-converted \
+             .deb payloads meant for spk-d (SPK on Debian) -- they assume a real Debian \
+             host's shared libraries are already present, which SmechOS doesn't provide. \
+             Install this with spk-d instead.{R}",
+            meta.name
+        );
+        let _ = fs::remove_dir_all(&stage);
+        return false;
+    }
+
+    // Signature gate for ~nix~ packages: the suffix alone is just text in a
+    // hand-editable control file (demonstrated directly -- a payload with
+    // zero /nix/store content, hand-labeled ~nix~, installed without
+    // complaint before this check existed). Every real nix2spk package
+    // carries a `signature` file alongside `control`; verify it against
+    // nix2spk's embedded public key before trusting this package at all,
+    // and refuse outright on anything missing or invalid. This runs before
+    // dependency resolution and the conflict guard -- an unverified package
+    // shouldn't get far enough to recurse into installing its (claimed)
+    // dependencies or touch the installed-files database at all.
+    if is_nix_package(&meta.name) {
+        let sig_path = format!("{control_dir}/signature");
+        let Ok(sig_b64) = fs::read_to_string(&sig_path) else {
+            println!(
+                "{RED}[spk] Refusing to install {}: no 'signature' file -- every ~nix~ \
+                 package must be signed by nix2spk. This package may be a forged/retagged \
+                 payload, not a real nix2spk output.{R}",
+                meta.name
+            );
+            let _ = fs::remove_dir_all(&stage);
+            return false;
+        };
+        let Some(data_sha256) = sha256_of_file(&data_tar) else {
+            println!("{RED}[spk] Refusing to install {}: failed to hash data.tar.xz.{R}", meta.name);
+            let _ = fs::remove_dir_all(&stage);
+            return false;
+        };
+        let message = signing_message_for(&meta.name, &meta.version, &meta.architecture, &data_sha256);
+        if !verify_signature(NIX2SPK_PUBKEY, &message, &sig_b64) {
+            println!(
+                "{RED}[spk] Refusing to install {}: signature verification failed -- this \
+                 package's control fields or payload don't match what nix2spk actually signed. \
+                 Refusing rather than risk installing a tampered or forged package.{R}",
+                meta.name
+            );
+            let _ = fs::remove_dir_all(&stage);
+            return false;
+        }
+        println!("{GREEN}[spk] Signature verified (nix2spk).{R}");
+    }
+
     if !meta.depends.is_empty() {
         println!("  {YELLOW}depends:{R} {}", meta.depends);
         if !resolve_dependencies(&meta.depends, root, resolving) {
             let _ = fs::remove_dir_all(&stage);
             return false;
+        }
+    }
+
+    if is_nix_package(&meta.name) {
+        println!(
+            "{CYAN}[spk] {} is a Nix-origin package (vendored via nix2spk) -- \
+             its payload bundles its own /nix/store closure; it is not a native spk build.{R}",
+            meta.name
+        );
+    }
+
+    // Conflict guard: a file this package would extract must not already
+    // be owned by some OTHER installed package, unless it's a /nix/store
+    // path -- multiple ~nix~ packages sharing closure members there is
+    // expected and fine. This is the concrete enforcement behind "~nix~
+    // packages are treated differently": it runs before any extraction
+    // happens, so a clash is refused cleanly instead of one package's
+    // files silently clobbering another's.
+    let incoming_files = tar_member_files(&data_tar);
+    for other_name in list_installed_names(root) {
+        if other_name == meta.name {
+            continue;
+        }
+        let Some(other_pkg) = read_installed(root, &other_name) else { continue };
+        for f in &incoming_files {
+            if f.starts_with("nix/store/") {
+                continue;
+            }
+            if other_pkg.files.iter().any(|of| of == f) {
+                println!(
+                    "{RED}[spk] Refusing to install {}: file '{}' is already owned by installed package '{}'.{R}",
+                    meta.name, f, other_pkg.name
+                );
+                let _ = fs::remove_dir_all(&stage);
+                return false;
+            }
         }
     }
 
@@ -491,29 +615,10 @@ fn install_spkg_file_inner(spkg_path: &str, root: &str, resolving: &mut Vec<Stri
         // The archive's own member list is the precise, authoritative
         // record of what this package just put on disk -- read it back
         // from data.tar.xz rather than re-deriving it any other way, so
-        // `remove` later knows exactly (and only) what to delete.
-        let files: Vec<String> = Command::new("tar")
-            .args(["-tf", &data_tar])
-            .output()
-            .ok()
-            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
-            .unwrap_or_default()
-            .lines()
-            // GNU tar lists directory members with a trailing '/' -- these
-            // are excluded outright, not just stripped of the slash:
-            // directories (usr/, usr/lib/, ...) are near-universally
-            // shared across packages, and `remove`'s file-deletion logic
-            // does a plain `rm -f`, which errors on a directory anyway.
-            // A package uninstall here never touches directories, only
-            // the regular files/symlinks it actually owns.
-            .filter(|l| !l.trim().is_empty() && *l != "." && !l.ends_with('/'))
-            // A data.tar.xz built by archiving "." (as `spk compile` does)
-            // lists members as "./usr/bin/foo"; one built from an explicit
-            // file list has no such prefix. Normalize both to the same
-            // form so `remove`'s shared-file check compares equal paths
-            // regardless of which tool produced the .spkg.
-            .map(|l| l.trim_start_matches("./").to_string())
-            .collect();
+        // `remove` later knows exactly (and only) what to delete. Same
+        // normalization the pre-extraction conflict guard above used, via
+        // the shared helper, so both agree on what this package owns.
+        let files = tar_member_files(&data_tar);
         if !write_installed_record(root, &meta, &files) {
             println!(
                 "{YELLOW}[spk] Warning: {} installed, but failed to write its record to \
@@ -607,6 +712,8 @@ struct InstalledPkg {
     name: String,
     version: String,
     depends: String,
+    provides: String,
+    conflicts: String,
     files: Vec<String>,
 }
 
@@ -653,6 +760,8 @@ fn read_installed(root: &str, name: &str) -> Option<InstalledPkg> {
     let text = fs::read_to_string(installed_db_path(root, name)).ok()?;
     let mut version = String::new();
     let mut depends = String::new();
+    let mut provides = String::new();
+    let mut conflicts = String::new();
     let mut files = Vec::new();
     let mut in_files = false;
     for line in text.lines() {
@@ -670,6 +779,8 @@ fn read_installed(root: &str, name: &str) -> Option<InstalledPkg> {
             match k.trim() {
                 "version" => version = v.trim().to_string(),
                 "depends" => depends = v.trim().to_string(),
+                "provides" => provides = v.trim().to_string(),
+                "conflicts" => conflicts = v.trim().to_string(),
                 _ => {}
             }
         }
@@ -678,6 +789,8 @@ fn read_installed(root: &str, name: &str) -> Option<InstalledPkg> {
         name: name.to_string(),
         version,
         depends,
+        provides,
+        conflicts,
         files,
     })
 }
@@ -690,6 +803,8 @@ fn write_installed_record(root: &str, meta: &ControlMeta, files: &[String]) -> b
     out.push_str(&format!("version: {}\n", meta.version));
     out.push_str(&format!("architecture: {}\n", meta.architecture));
     out.push_str(&format!("depends: {}\n", meta.depends));
+    out.push_str(&format!("provides: {}\n", meta.provides));
+    out.push_str(&format!("conflicts: {}\n", meta.conflicts));
     out.push_str("files:\n");
     for f in files {
         out.push_str(f);
@@ -709,9 +824,15 @@ fn parse_depends(depends: &str) -> Vec<String> {
         .split(',')
         .map(|s| s.trim())
         .filter(|s| !s.is_empty())
+        // Fallback (no index.meta) can't choose between alternatives: take the first.
+        .map(|s| s.split('|').next().unwrap_or(s))
         .map(|s| s.split('(').next().unwrap_or(s).trim().to_string())
         .collect()
 }
+
+/// Passed in `resolving` when the solver has already ordered the install, so
+/// the per-package fallback resolver must not re-resolve (or reject cycles).
+const SOLVED_MARKER: &str = "*solved*";
 
 /// Recursively install whatever `depends` names aren't already installed,
 /// before the package that declared them. `resolving` is the current
@@ -719,6 +840,9 @@ fn parse_depends(depends: &str) -> Vec<String> {
 /// an already-installed dependency is skipped entirely, never added
 /// here).
 fn resolve_dependencies(depends: &str, root: &str, resolving: &mut Vec<String>) -> bool {
+    if resolving.iter().any(|r| r == SOLVED_MARKER) {
+        return true;
+    }
     for dep in parse_depends(depends) {
         if is_installed(root, &dep) {
             continue;
@@ -748,6 +872,53 @@ fn resolve_dependencies(depends: &str, root: &str, resolving: &mut Vec<String>) 
 fn looks_like_local_path(s: &str) -> bool {
     s.contains('/') || s.starts_with('.') || s.starts_with('~')
         || s.ends_with(".spkg") || s.ends_with(".tar.xz")
+}
+
+/// A package produced by nix2spk (a Nix binary from cache.nixos.org,
+/// repackaged as a .spkg with its own /nix/store closure bundled as inert
+/// payload data) -- never a native, from-source spk build. The `~nix~`
+/// name suffix is the single source of truth `spk` uses to tell the two
+/// apart; this is the one place that check lives.
+fn is_nix_package(name: &str) -> bool {
+    name.ends_with("~nix~")
+}
+
+/// A package produced by apt2spk (a Debian .deb repackaged as a .spkg) --
+/// meant for spk-d (SPK on Debian), never for spk itself. Unlike `~nix~`,
+/// which spk accepts and gives special handling, `~apt~` packages are
+/// refused outright: a .deb's payload dynamically links against the
+/// *host's own* shared libraries at ordinary FHS paths (no bundled
+/// closure the way nix2spk ships one), which only makes sense on the
+/// actual Debian system spk-d targets, not on SmechOS.
+fn is_apt_package(name: &str) -> bool {
+    name.ends_with("~apt~")
+}
+
+/// The normalized list of regular-file/symlink members a data.tar.xz will
+/// produce on extraction -- same filtering/normalization
+/// `install_spkg_file_inner` already needs twice (once to pre-check for
+/// conflicts before extracting, once to write the installed-files record
+/// after), pulled out so both call sites agree exactly on what counts as
+/// "a file this package owns".
+fn tar_member_files(data_tar: &str) -> Vec<String> {
+    Command::new("tar")
+        .args(["-tf", data_tar])
+        .output()
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+        .unwrap_or_default()
+        .lines()
+        // GNU tar lists directory members with a trailing '/' -- excluded
+        // outright, not just stripped of the slash: directories are
+        // near-universally shared across packages, and the conflict guard
+        // (and remove's deletion logic) only cares about files it alone
+        // would delete/claim.
+        .filter(|l| !l.trim().is_empty() && *l != "." && !l.ends_with('/'))
+        // A data.tar.xz built by archiving "." (as `spk compile` does)
+        // lists members as "./usr/bin/foo"; one built from an explicit
+        // file list has no such prefix. Normalize both to the same form.
+        .map(|l| l.trim_start_matches("./").to_string())
+        .collect()
 }
 
 // ── Package install ───────────────────────────────────────────────────────────
@@ -818,6 +989,8 @@ fn fetch_and_install_inner(pkg: &str, root: &str, resolving: &mut Vec<String>) -
                 architecture: "x86_64".to_string(),
                 depends: String::new(),
                 description: String::new(),
+                provides: String::new(),
+                conflicts: String::new(),
             };
             write_installed_record(root, &legacy_meta, &legacy_files);
             println!("{GREEN}[spk] {pkg} installed.{R}");
@@ -830,8 +1003,115 @@ fn fetch_and_install_inner(pkg: &str, root: &str, resolving: &mut Vec<String>) -
     }
 }
 
+/// Candidate packages from the `index.meta` of every *trusted* repo. None when
+/// no trusted repo publishes one, in which case spk falls back to the older
+/// per-package resolver. Untrusted repos are deliberately not consulted: the
+/// plan must only name packages that fetch_package_ext will fetch from a
+/// trusted repo.
+fn fetch_index_meta() -> Option<Vec<resolver::Pkg>> {
+    let mut all: Vec<resolver::Pkg> = Vec::new();
+    for repo in load_repos().iter().filter(|r| r.priority < 100) {
+        let tmp = format!("/tmp/spk-meta-{}.txt", std::process::id());
+        let url = format!("{}/index.meta", repo.url.trim_end_matches('/'));
+        let ok = Command::new("curl")
+            .args(["-sfL", "-o", &tmp, &url])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !ok {
+            let _ = fs::remove_file(&tmp);
+            continue;
+        }
+        let text = fs::read_to_string(&tmp).unwrap_or_default();
+        let _ = fs::remove_file(&tmp);
+        for p in resolver::parse_index_meta(&text) {
+            if !all.iter().any(|q| q.name == p.name && q.version == p.version) {
+                all.push(p);
+            }
+        }
+    }
+    if all.is_empty() { None } else { Some(all) }
+}
+
+/// Solve `request` against the repo metadata and the installed set.
+/// None = no usable metadata (or the request isn't in it): use the fallback.
+fn plan_install(request: &str, root: &str) -> Option<Result<Vec<resolver::Pkg>, String>> {
+    if env::var("SPK_NO_SOLVER").is_ok()
+        || looks_like_local_path(request)
+        || is_nix_package(request)
+        || is_apt_package(request)
+    {
+        return None;
+    }
+    let dep = resolver::parse_dep(request)?;
+    let available = fetch_index_meta()?;
+    let installed: Vec<resolver::Pkg> = list_installed_names(root)
+        .iter()
+        .filter_map(|n| read_installed(root, n))
+        .map(|p| resolver::Pkg::new(&p.name, &p.version, &p.depends, &p.provides, &p.conflicts))
+        .collect();
+    let uni = resolver::Universe { available, installed };
+    match resolver::Solver::new(&uni).solve(&[vec![dep]]) {
+        Ok(plan) => Some(Ok(plan)),
+        Err(resolver::SolveError::NotFound(_)) => None,
+        Err(e) => Some(Err(e.message())),
+    }
+}
+
+fn describe_plan(plan: &[resolver::Pkg]) -> String {
+    plan.iter()
+        .map(|p| format!("{} {}", p.name, p.version))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// `spk solve <pkg>`: show what an install would do, without installing.
+fn cmd_solve(request: &str) {
+    match plan_install(request, target_root()) {
+        Some(Ok(plan)) if plan.is_empty() => {
+            println!("{GREEN}[spk] Nothing to install: {request} and its dependencies are already satisfied.{R}");
+        }
+        Some(Ok(plan)) => {
+            println!("{CYAN}[spk] {request} would install {} package(s), in this order:{R}", plan.len());
+            for p in &plan {
+                println!("  {GREEN}{}{R} {}", p.name, p.version);
+            }
+        }
+        Some(Err(msg)) => {
+            println!("{RED}[spk] Cannot resolve {request}: {msg}{R}");
+            exit(1);
+        }
+        None => {
+            println!("{YELLOW}[spk] No dependency metadata (index.meta) available for {request}; \
+                      install would use the basic per-package resolver.{R}");
+        }
+    }
+}
+
 fn cmd_install(pkg: &str) {
     println!("{BOLD}[spk] Installing: {pkg}{R}");
+    let root = target_root();
+    match plan_install(pkg, root) {
+        Some(Err(msg)) => {
+            println!("{RED}{BOLD}[spk] Cannot resolve dependencies for {pkg}: {msg}{R}");
+            println!("{YELLOW}[spk] Set SPK_NO_SOLVER=1 to skip the solver and use the basic resolver.{R}");
+            exit(1);
+        }
+        Some(Ok(plan)) if !plan.is_empty() => {
+            println!("{CYAN}[spk] Resolved {} package(s): {}{R}", plan.len(), describe_plan(&plan));
+            for p in &plan {
+                let mut marker = vec![SOLVED_MARKER.to_string()];
+                if !fetch_and_install_inner(&p.name, root, &mut marker) {
+                    println!("{RED}{BOLD}[spk] Installation failed for {} (needed by {pkg}).{R}", p.name);
+                    exit(1);
+                }
+            }
+            println!("{GREEN}{BOLD}[spk] {pkg} installed successfully.{R}");
+            return;
+        }
+        // Empty plan (already installed, so reinstall as before) or no metadata:
+        _ => {}
+    }
     if !fetch_and_install(pkg, target_root()) {
         println!("{RED}{BOLD}[spk] Installation failed for {pkg}.{R}");
         exit(1);
@@ -852,7 +1132,8 @@ fn cmd_list() {
     println!("{BOLD}Installed packages ({}){R}", names.len());
     for name in &names {
         if let Some(p) = read_installed(root, name) {
-            println!("  {GREEN}{}{R}  {}", p.name, p.version);
+            let badge = if is_nix_package(&p.name) { format!(" {YELLOW}[nix]{R}") } else { String::new() };
+            println!("  {GREEN}{}{R}  {}{badge}", p.name, p.version);
         }
     }
 }
@@ -867,7 +1148,8 @@ fn cmd_depends(name: &str) {
         seen.insert(name.to_string());
         match read_installed(root, name) {
             Some(p) => {
-                println!("{indent}{GREEN}{}{R} {}", p.name, p.version);
+                let badge = if is_nix_package(&p.name) { format!(" {YELLOW}[nix]{R}") } else { String::new() };
+                println!("{indent}{GREEN}{}{R} {}{badge}", p.name, p.version);
                 for dep in parse_depends(&p.depends) {
                     print_tree(root, &dep, depth + 1, seen);
                 }
@@ -1073,36 +1355,11 @@ fn cmd_system_upgrade() {
 
     let mut failures: Vec<String> = Vec::new();
 
-    if is_smechvisor() {
-        println!("{CYAN}[spk] SmechVisor detected -- live OTA upgrade{R}");
-        for (pkg, needs_reboot) in SMECHVISOR_PACKAGES {
-            if *pkg == "smechvisor-daemon" {
-                // Live swap: stop daemon, replace binary, restart
-                let _ = Command::new("rc-service").args(["smechvisord", "stop"]).status();
-            }
-            if fetch_and_install(pkg, "/") {
-                if *pkg == "smechvisor-daemon" {
-                    let _ = Command::new("rc-service").args(["smechvisord", "start"]).status();
-                    println!("{GREEN}[spk] smechvisord restarted live -- no reboot needed.{R}");
-                } else if *needs_reboot {
-                    println!("{YELLOW}[spk] {pkg} updated -- reboot to activate.{R}");
-                }
-            } else {
-                if *pkg == "smechvisor-daemon" {
-                    // Re-start old binary even on failure
-                    let _ = Command::new("rc-service").args(["smechvisord", "start"]).status();
-                }
-                failures.push(pkg.to_string());
-            }
-        }
-    } else {
-        println!("{CYAN}[spk] SmechOS detected -- full system upgrade{R}");
-        let root = target_root();
-        for (i, pkg) in SMECHOS_PACKAGES.iter().enumerate() {
-            println!("{BOLD}[{}/{}] Re-fetching {pkg}...{R}", i + 1, SMECHOS_PACKAGES.len());
-            if !fetch_and_install(pkg, root) {
-                failures.push(pkg.to_string());
-            }
+    let root = target_root();
+    for (i, pkg) in SMECHOS_PACKAGES.iter().enumerate() {
+        println!("{BOLD}[{}/{}] Re-fetching {pkg}...{R}", i + 1, SMECHOS_PACKAGES.len());
+        if !fetch_and_install(pkg, root) {
+            failures.push(pkg.to_string());
         }
     }
 
@@ -1324,8 +1581,8 @@ fn cmd_build_image(args: &[String]) {
 // ── spk compile: build ONE package's source into a .spkg ────────────────────
 //
 // Not to be confused with `spk build-image`, which forwards to
-// spk-compile.py to build an entire SmechOS/SmechVisor image from source --
-// a different job by an order of magnitude. `compile` here is the verb a
+// spk-compile.py to build an entire SmechOS image from source -- a
+// different job by an order of magnitude. `compile` here is the verb a
 // package manager actually owns: take a recipe describing how to build and
 // stage one component, run it, and package the result. Pure Rust, no
 // spk-compile.py involved -- same "shell out to real build tools, don't
@@ -1504,175 +1761,6 @@ fn cmd_compile_package(recipe_path: &str, out_override: Option<&str>) {
     println!("{GREEN}[spk] Built {out_path}{R}");
 }
 
-// ── Deploy (SmechVisor network deploy) ───────────────────────────────────────
-
-fn gen_code() -> String {
-    let t = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    let pid = std::process::id() as u128;
-    format!("{:07x}", (t ^ (pid << 17)) & 0x0FFF_FFFF)
-}
-
-/// Push SmechVisor packages to a shim node that is broadcasting `code`.
-fn cmd_deploy_to(code: &str) {
-    println!("{CYAN}[spk] Listening for shim broadcasting code '{code}' on UDP {SHIM_UDP_PORT}...{R}");
-    let recv_sock = UdpSocket::bind(format!("0.0.0.0:{SHIM_UDP_PORT}"))
-        .expect("[spk] UDP listen bind failed");
-    recv_sock.set_read_timeout(Some(Duration::from_secs(120))).ok();
-
-    let expected = format!("{BROADCAST_MAGIC}:{code}");
-    let mut buf = [0u8; 256];
-
-    let shim_ip = loop {
-        match recv_sock.recv_from(&mut buf) {
-            Ok((n, addr)) => {
-                if String::from_utf8_lossy(&buf[..n]).trim() == expected {
-                    println!("{GREEN}[spk] Shim found at {}{R}", addr.ip());
-                    break addr.ip().to_string();
-                }
-            }
-            Err(_) => {
-                println!("{RED}[spk] Timed out. Is the shim ISO running on the target machine?{R}");
-                exit(1);
-            }
-        }
-    };
-
-    let tcp_addr = format!("{shim_ip}:{SHIM_TCP_PORT}");
-    println!("{CYAN}[spk] Connecting to shim TCP at {tcp_addr}...{R}");
-    let mut stream = std::net::TcpStream::connect(&tcp_addr)
-        .expect("[spk] TCP connect to shim failed");
-
-    let packages = ["smechvisor-base", "smechvisor-daemon"];
-    for pkg_name in &packages {
-        let tmp = format!("/tmp/spk-deploy-{pkg_name}.tar.xz");
-
-        println!("{CYAN}[spk] Fetching {pkg_name}...{R}");
-        let ok = fetch_package(pkg_name, &tmp);
-        if !ok {
-            println!("{YELLOW}[spk] Warning: failed to fetch {pkg_name}, skipping.{R}");
-            continue;
-        }
-
-        let data = fs::read(&tmp).expect("read package file");
-        let _ = fs::remove_file(&tmp);
-
-        let name_bytes = pkg_name.as_bytes();
-        stream.write_all(&(name_bytes.len() as u32).to_be_bytes()).ok();
-        stream.write_all(name_bytes).ok();
-        stream.write_all(&(data.len() as u64).to_be_bytes()).ok();
-        stream.write_all(&data).ok();
-        stream.flush().ok();
-        println!("{GREEN}[spk] Sent {pkg_name} ({} MB){R}", data.len() / 1_048_576);
-    }
-    // Terminator: 4-byte zero name length
-    stream.write_all(&0u32.to_be_bytes()).ok();
-    stream.flush().ok();
-    println!("{GREEN}{BOLD}[spk] All packages sent. Shim will install and reboot.{R}");
-}
-
-/// Receive a SmechVisor deploy from a donor node (runs on the shim).
-fn cmd_receive_deploy() {
-    let code = gen_code();
-
-    // Clear screen and show code banner
-    print!("\x1b[2J\x1b[H");
-    println!("{BOLD}{MAGENTA}");
-    println!("  +------------------------------------------+");
-    println!("  |      SMECHVISOR DEPLOY RECEIVER          |");
-    println!("  +------------------------------------------+");
-    println!("  |                                          |");
-    println!("  |  Your deploy code:                       |");
-    println!("  |                                          |");
-    println!("  |    {YELLOW}{code}{MAGENTA}                        |");
-    println!("  |                                          |");
-    println!("  |  On the donor node run:                  |");
-    println!("  |    spk deploy-system-img-copy {code}  |");
-    println!("  |                                          |");
-    println!("  +------------------------------------------+{R}");
-    println!();
-
-    // Broadcast UDP in background thread
-    let code_for_broadcast = code.clone();
-    std::thread::spawn(move || {
-        if let Ok(sock) = UdpSocket::bind("0.0.0.0:0") {
-            sock.set_broadcast(true).ok();
-            let msg = format!("{BROADCAST_MAGIC}:{code_for_broadcast}");
-            loop {
-                sock.send_to(msg.as_bytes(), format!("255.255.255.255:{SHIM_UDP_PORT}")).ok();
-                std::thread::sleep(Duration::from_secs(2));
-            }
-        }
-    });
-
-    // Listen for TCP from donor
-    let listener = TcpListener::bind(format!("0.0.0.0:{SHIM_TCP_PORT}"))
-        .expect("[spk] TCP bind failed");
-    println!("{CYAN}[spk] Waiting for donor on TCP port {SHIM_TCP_PORT}...{R}");
-    let (mut stream, addr) = listener.accept().expect("[spk] accept failed");
-    println!("{GREEN}[spk] Donor connected from {addr}{R}");
-
-    let target = "/mnt/target";
-    let _ = fs::create_dir_all(target);
-
-    loop {
-        let mut name_len_buf = [0u8; 4];
-        if stream.read_exact(&mut name_len_buf).is_err() {
-            break;
-        }
-        let name_len = u32::from_be_bytes(name_len_buf);
-        if name_len == 0 {
-            break; // terminator
-        }
-
-        let mut name_buf = vec![0u8; name_len as usize];
-        if stream.read_exact(&mut name_buf).is_err() {
-            break;
-        }
-        let name = String::from_utf8_lossy(&name_buf).to_string();
-
-        let mut data_len_buf = [0u8; 8];
-        stream.read_exact(&mut data_len_buf).expect("read data_len");
-        let data_len = u64::from_be_bytes(data_len_buf);
-
-        println!("{CYAN}[spk] Receiving '{name}' ({} MB)...{R}", data_len / 1_048_576);
-
-        // Stream directly into tar stdin to avoid buffering full package in RAM
-        let mut child = Command::new("tar")
-            .args(["-xJf", "-", "-C", target])
-            .stdin(Stdio::piped())
-            .spawn()
-            .expect("tar spawn");
-
-        let mut remaining = data_len;
-        let mut buf = [0u8; 65536];
-        if let Some(mut stdin) = child.stdin.take() {
-            while remaining > 0 {
-                let to_read = remaining.min(buf.len() as u64) as usize;
-                match stream.read(&mut buf[..to_read]) {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        if stdin.write_all(&buf[..n]).is_err() {
-                            break;
-                        }
-                        remaining -= n as u64;
-                    }
-                    Err(_) => break,
-                }
-            }
-        }
-        child.wait().ok();
-        println!("{GREEN}[spk] '{name}' installed into {target}.{R}");
-    }
-
-    println!("{GREEN}{BOLD}[spk] Receive complete. Rebooting...{R}");
-    let _ = Command::new("sync").status();
-    let _ = Command::new("reboot").arg("-f").spawn();
-    std::thread::sleep(Duration::from_secs(5));
-}
-
 // ── PackageKit backend (script protocol) ─────────────────────────────────────
 //
 // PackageKit spawns this as `spk packagekit-backend` and communicates via
@@ -1708,13 +1796,8 @@ fn cmd_packagekit_backend() {
             continue;
         }
 
-        // Build the active package list based on which OS we're running on
-        let active_pkgs: Vec<&str> = if is_smechvisor() {
-            SMECHVISOR_PACKAGES.iter().map(|(n, _)| *n).collect()
-        } else {
-            SMECHOS_PACKAGES.to_vec()
-        };
-        let repo_id = if is_smechvisor() { "smechvisor" } else { "smechos" };
+        let active_pkgs: Vec<&str> = SMECHOS_PACKAGES.to_vec();
+        let repo_id = "smechos";
 
         match parts[0] {
             "get-packages" => {
@@ -1867,6 +1950,14 @@ fn main() {
             cmd_depends(&args[2]);
         }
 
+        "solve" => {
+            if args.len() < 3 {
+                println!("{RED}[spk] Error: specify a package.   spk solve <pkg>{R}");
+                exit(1);
+            }
+            cmd_solve(&args[2]);
+        }
+
         "create-live-image" => {
             if args.len() < 3 {
                 println!(
@@ -1912,16 +2003,6 @@ fn main() {
             cmd_build_image(&args[2..].to_vec());
         }
 
-        "deploy-system-img-copy" => {
-            if args.len() < 3 {
-                println!("{RED}[spk] Error: specify a code.   spk deploy-system-img-copy <code>{R}");
-                exit(1);
-            }
-            cmd_deploy_to(&args[2]);
-        }
-
-        "receive-deploy" => cmd_receive_deploy(),
-
         "packagekit-backend" => cmd_packagekit_backend(),
 
         // ── Legacy aliases (v1.x compat) ─────────────────────────────────────
@@ -1950,6 +2031,34 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn signing_message_matches_python_converter_format() {
+        let msg = signing_message_for("hello~nix~", "2.12.3", "x86_64", "abc123");
+        assert_eq!(
+            msg,
+            b"spk-sig-v1\nname=hello~nix~\nversion=2.12.3\narchitecture=x86_64\nsha256=abc123\n"
+        );
+    }
+
+    #[test]
+    fn base64_decode_round_trips_known_vectors() {
+        // "hello" -> "aGVsbG8=" is a standard, widely-known vector.
+        assert_eq!(base64_decode("aGVsbG8=").unwrap(), b"hello");
+        // Real-shaped Ed25519 raw signature is 64 bytes -- decode one of
+        // our own real public keys (base64 body only) and check the length
+        // comes out byte-exact rather than off-by-one from padding math.
+        let decoded = base64_decode("/B2iaPNEITKzbMvMd5PXD9Tjxv3dXLd5NaNvIvnNIHE=").unwrap();
+        assert_eq!(decoded.len(), 32);
+    }
+
+    #[test]
+    fn verify_signature_rejects_tampered_message() {
+        // Without a real matching private key in the test environment, this
+        // just confirms the plumbing fails closed on garbage input rather
+        // than panicking or (worse) succeeding.
+        assert!(!verify_signature(NIX2SPK_PUBKEY, b"not signed", "not-base64-sig"));
+    }
 
     #[test]
     fn parses_multiple_repos_with_priority_order() {
@@ -2041,6 +2150,20 @@ repos:
     }
 
     #[test]
+    fn parses_flow_style_yaml() {
+        // The old hand-rolled parser only ever understood block-style `-
+        // name: ...` list items; real YAML also allows this compact
+        // flow-style form. Proving this works is the actual point of
+        // moving to yaml-rust2 instead of keeping the subset parser.
+        let yaml = r#"repos: [{name: flow, url: "https://example.com/flow", priority: 7}]"#;
+        let repos = parse_repo_conf(yaml);
+        assert_eq!(repos.len(), 1);
+        assert_eq!(repos[0].name, "flow");
+        assert_eq!(repos[0].url, "https://example.com/flow");
+        assert_eq!(repos[0].priority, 7);
+    }
+
+    #[test]
     fn parses_control_file() {
         let text = "name: kcoreaddons\nversion: 6.24.0\narchitecture: x86_64\ndepends: qt6-base\ndescription: KDE Frameworks - KCoreAddons\n";
         let m = parse_control(text);
@@ -2069,5 +2192,16 @@ repos:
         assert!(looks_like_local_path("foo.tar.xz"));
         assert!(!looks_like_local_path("firefox"));
         assert!(!looks_like_local_path("kde-frameworks"));
+    }
+
+    #[test]
+    fn detects_origin_suffixes() {
+        assert!(is_nix_package("hello~nix~"));
+        assert!(!is_nix_package("hello~apt~"));
+        assert!(!is_nix_package("hello"));
+
+        assert!(is_apt_package("hello~apt~"));
+        assert!(!is_apt_package("hello~nix~"));
+        assert!(!is_apt_package("hello"));
     }
 }
