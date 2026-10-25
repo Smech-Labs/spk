@@ -992,11 +992,20 @@ fn is_root() -> bool {
 }
 
 fn target_root() -> &'static str {
-    if Path::new("/mnt/smechos").exists() {
-        "/mnt/smechos"
-    } else {
-        "/"
-    }
+    // SPK_ROOT overrides the target (build sandboxes, tests): an empty root
+    // has an empty installed-package database, so nothing is "already there".
+    static ROOT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    ROOT.get_or_init(|| {
+        if let Ok(r) = env::var("SPK_ROOT") {
+            return r;
+        }
+        if Path::new("/mnt/smechos").exists() {
+            "/mnt/smechos".to_string()
+        } else {
+            "/".to_string()
+        }
+    })
+    .as_str()
 }
 
 // ── .spkg format ──────────────────────────────────────────────────────────────
@@ -1800,7 +1809,27 @@ fn describe_plan(plan: &[resolver::Pkg]) -> String {
 }
 
 /// `spk solve <pkg>`: show what an install would do, without installing.
-fn cmd_solve(request: &str) {
+fn cmd_solve(request: &str, porcelain: bool) {
+    if porcelain {
+        // Machine-readable: one "name version" line per package, install
+        // order, nothing else on stdout. Failures go to stderr with exit 1.
+        match plan_install(request, target_root()) {
+            Some(Ok(plan)) => {
+                for p in &plan {
+                    println!("{} {}", p.name, p.version);
+                }
+                return;
+            }
+            Some(Err(msg)) => {
+                eprintln!("{msg}");
+                exit(1);
+            }
+            None => {
+                eprintln!("no dependency metadata (index.meta) available");
+                exit(2);
+            }
+        }
+    }
     match plan_install(request, target_root()) {
         Some(Ok(plan)) if plan.is_empty() => {
             println!("{GREEN}[spk] Nothing to install: {request} and its dependencies are already satisfied.{R}");
@@ -2685,11 +2714,13 @@ fn main() {
         }
 
         "solve" => {
-            if args.len() < 3 {
-                println!("{RED}[spk] Error: specify a package.   spk solve <pkg>{R}");
+            let porcelain = args.iter().skip(2).any(|a| a == "--porcelain");
+            let reqs: Vec<&String> = args.iter().skip(2).filter(|a| *a != "--porcelain").collect();
+            if reqs.len() != 1 {
+                println!("{RED}[spk] Error: specify one package.   spk solve [--porcelain] <pkg>{R}");
                 exit(1);
             }
-            cmd_solve(&args[2]);
+            cmd_solve(reqs[0], porcelain);
         }
 
         "create-live-image" => {
