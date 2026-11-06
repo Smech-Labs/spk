@@ -285,6 +285,16 @@ repos:
     priority: 10
 ```
 
+### Dependency solver
+
+spk resolves dependencies with [libsolv](https://github.com/openSUSE/libsolv),
+the solver behind DNF. libsolv is a required dependency: `libsolv.so` at run
+time and its development files (`libsolv-dev` / `libsolv-devel`, which include
+`libsolvext`) to build. Version comparison follows dpkg rules.
+
+`SPK_SOLVER=builtin` switches to the older in-tree solver, and
+`SPK_SOLVER=compare` runs both and prints any difference on stderr.
+
 ### Signed repositories
 
 A repo entry can carry the Ed25519 public key its indexes are signed with.

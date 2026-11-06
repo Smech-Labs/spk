@@ -547,7 +547,14 @@ mod resolver {
         /// Order the newly selected packages so dependencies come first.
         /// Dependency cycles are legal: back-edges are ignored.
         fn order(chosen: &[Chosen]) -> Vec<Pkg> {
-            let new: Vec<&Pkg> = chosen.iter().filter(|c| !c.installed).map(|c| &c.pkg).collect();
+            let owned: Vec<Pkg> = chosen.iter().filter(|c| !c.installed).map(|c| c.pkg.clone()).collect();
+            Self::order_packages(&owned)
+        }
+
+        /// Dependencies-first order for an already chosen set of new packages.
+        /// Shared with the optional libsolv backend, which only picks the set.
+        pub fn order_packages(owned: &[Pkg]) -> Vec<Pkg> {
+            let new: Vec<&Pkg> = owned.iter().collect();
             let mut done: HashSet<String> = HashSet::new();
             let mut out: Vec<Pkg> = Vec::new();
             fn visit<'a>(
@@ -2241,6 +2248,312 @@ fn fetch_and_install_inner(pkg: &str, root: &str, resolving: &mut Vec<String>) -
     }
 }
 
+/// libsolv, the dependency solver behind DNF, is spk's solver and a hard
+/// dependency (libsolv.so at run time, libsolv-dev to build). It picks the
+/// package set; the in-tree resolver's ordering then puts dependencies first.
+/// Hand-written FFI on purpose: spk has no crate dependencies besides yaml-rust2.
+mod libsolv_backend {
+    use super::resolver::{Dep, Op, Pkg, SolveError, Solver, Universe};
+    use std::collections::HashMap;
+    use std::ffi::{CStr, CString};
+    use std::os::raw::{c_char, c_int, c_void};
+
+    type Id = c_int;
+
+    #[repr(C)]
+    struct Queue {
+        elements: *mut Id,
+        count: c_int,
+        alloc: *mut Id,
+        left: c_int,
+    }
+    #[repr(C)]
+    struct Pool {
+        _opaque: [u8; 0],
+    }
+    #[repr(C)]
+    struct Repo {
+        _opaque: [u8; 0],
+    }
+    #[repr(C)]
+    struct LsSolver {
+        _opaque: [u8; 0],
+    }
+
+    const DISTTYPE_DEB: c_int = 1;
+    const SOLVER_SOLVABLE_PROVIDES: Id = 0x03;
+    const SOLVER_INSTALL: Id = 0x0100;
+    const TESTCASE_RESULT_TRANSACTION: c_int = 1 << 0;
+    const TESTCASE_RESULT_PROBLEMS: c_int = 1 << 1;
+
+    #[link(name = "solv")]
+    extern "C" {
+        fn pool_create() -> *mut Pool;
+        fn pool_free(pool: *mut Pool);
+        fn pool_setdisttype(pool: *mut Pool, disttype: c_int) -> c_int;
+        fn pool_set_installed(pool: *mut Pool, repo: *mut Repo);
+        fn pool_createwhatprovides(pool: *mut Pool);
+        fn repo_create(pool: *mut Pool, name: *const c_char) -> *mut Repo;
+        fn solver_create(pool: *mut Pool) -> *mut LsSolver;
+        fn solver_free(solv: *mut LsSolver);
+        fn solver_solve(solv: *mut LsSolver, job: *mut Queue) -> c_int;
+        fn queue_init(q: *mut Queue);
+        fn queue_free(q: *mut Queue);
+        fn queue_insert2(q: *mut Queue, pos: c_int, id1: Id, id2: Id);
+    }
+    #[link(name = "solvext")]
+    extern "C" {
+        fn testcase_add_testtags(repo: *mut Repo, fp: *mut c_void, flags: c_int) -> c_int;
+        fn testcase_str2dep(pool: *mut Pool, s: *const c_char) -> Id;
+        fn testcase_solverresult(solv: *mut LsSolver, flags: c_int) -> *mut c_char;
+    }
+    extern "C" {
+        fn tmpfile() -> *mut c_void;
+        fn fwrite(ptr: *const c_void, size: usize, n: usize, fp: *mut c_void) -> usize;
+        fn rewind(fp: *mut c_void);
+        fn fclose(fp: *mut c_void) -> c_int;
+        fn free(p: *mut c_void);
+    }
+
+    fn dep_str(d: &Dep) -> String {
+        match &d.constraint {
+            None => d.name.clone(),
+            Some((op, v)) => {
+                let o = match op {
+                    Op::Ge => ">=",
+                    Op::Le => "<=",
+                    Op::Gt => ">",
+                    Op::Lt => "<",
+                    Op::Eq => "=",
+                };
+                format!("{} {} {}", d.name, o, v)
+            }
+        }
+    }
+
+    fn alts_str(alts: &[Dep]) -> String {
+        alts.iter().map(dep_str).collect::<Vec<_>>().join(" | ")
+    }
+
+    /// libsolv's text package format. It splits a version at its last '-'
+    /// into version and release and joins them back, so "1.2-3" round-trips.
+    fn tags(pkgs: &[Pkg]) -> String {
+        let mut s = String::new();
+        for p in pkgs {
+            let (ver, rel) = match p.version.rsplit_once('-') {
+                Some((v, r)) if !v.is_empty() && !r.is_empty() => (v, r),
+                _ => (p.version.as_str(), "-"),
+            };
+            s += &format!("=Pkg: {} {} {} noarch\n", p.name, ver, rel);
+            s += &format!("=Prv: {} = {}\n", p.name, p.version);
+            for (n, v) in &p.provides {
+                match v {
+                    Some(v) => s += &format!("=Prv: {n} = {v}\n"),
+                    None => s += &format!("=Prv: {n}\n"),
+                }
+            }
+            for alts in &p.depends {
+                if !alts.is_empty() {
+                    s += &format!("=Req: {}\n", alts_str(alts));
+                }
+            }
+            for c in &p.conflicts {
+                s += &format!("=Con: {}\n", dep_str(c));
+            }
+        }
+        s
+    }
+
+    unsafe fn add_repo(pool: *mut Pool, name: &str, pkgs: &[Pkg]) -> Result<*mut Repo, String> {
+        let cname = CString::new(name).map_err(|e| e.to_string())?;
+        let repo = repo_create(pool, cname.as_ptr());
+        let text = tags(pkgs);
+        let fp = tmpfile();
+        if fp.is_null() {
+            return Err("libsolv: tmpfile() failed".to_string());
+        }
+        fwrite(text.as_ptr() as *const c_void, 1, text.len(), fp);
+        rewind(fp);
+        let rc = testcase_add_testtags(repo, fp, 0);
+        fclose(fp);
+        if rc != 0 {
+            return Err(format!("libsolv: could not load the {name} package list"));
+        }
+        Ok(repo)
+    }
+
+    /// Resolve `requests` with libsolv; same contract as Solver::solve.
+    pub fn solve(uni: &Universe, requests: &[Vec<Dep>]) -> Result<Vec<Pkg>, SolveError> {
+        let by_id: HashMap<String, &Pkg> = uni
+            .available
+            .iter()
+            .map(|p| (format!("{}-{}.noarch", p.name, p.version), p))
+            .collect();
+        let text = unsafe {
+            let pool = pool_create();
+            pool_setdisttype(pool, DISTTYPE_DEB);
+            let installed = add_repo(pool, "@System", &uni.installed);
+            let available = add_repo(pool, "available", &uni.available);
+            let (installed, _available) = match (installed, available) {
+                (Ok(i), Ok(a)) => (i, a),
+                (Err(e), _) | (_, Err(e)) => {
+                    pool_free(pool);
+                    return Err(SolveError::Unsatisfiable(e));
+                }
+            };
+            pool_set_installed(pool, installed);
+            pool_createwhatprovides(pool);
+            let mut job = Queue { elements: std::ptr::null_mut(), count: 0, alloc: std::ptr::null_mut(), left: 0 };
+            queue_init(&mut job);
+            for alts in requests {
+                let c = CString::new(alts_str(alts)).unwrap_or_default();
+                let id = testcase_str2dep(pool, c.as_ptr());
+                queue_insert2(&mut job, job.count, SOLVER_INSTALL | SOLVER_SOLVABLE_PROVIDES, id);
+            }
+            let solv = solver_create(pool);
+            let problems = solver_solve(solv, &mut job);
+            let flags = if problems == 0 { TESTCASE_RESULT_TRANSACTION } else { TESTCASE_RESULT_PROBLEMS };
+            let raw = testcase_solverresult(solv, flags);
+            let text = if raw.is_null() { String::new() } else { CStr::from_ptr(raw).to_string_lossy().into_owned() };
+            if !raw.is_null() {
+                free(raw as *mut c_void);
+            }
+            queue_free(&mut job);
+            solver_free(solv);
+            pool_free(pool);
+            (problems, text)
+        };
+        let (problems, text) = text;
+        if problems != 0 {
+            let first = requests.first().and_then(|a| a.first()).map(|d| d.name.clone()).unwrap_or_default();
+            if let Some(i) = text.find("nothing provides ") {
+                let rest = &text[i + "nothing provides ".len()..];
+                let what = rest.split(" needed by").next().unwrap_or(rest).lines().next().unwrap_or("").trim();
+                let what = what.strip_prefix("requested ").unwrap_or(what);
+                if what == first || requests.iter().flatten().any(|d| d.name == what) {
+                    return Err(SolveError::NotFound(what.to_string()));
+                }
+            }
+            return Err(SolveError::Unsatisfiable(text.trim().to_string()));
+        }
+        let mut chosen: Vec<Pkg> = Vec::new();
+        for line in text.lines() {
+            let mut it = line.split_whitespace();
+            match (it.next(), it.next()) {
+                (Some("install"), Some(id)) | (Some("upgrade"), Some(id)) => {
+                    let key = id.rsplit_once('@').map(|(a, _)| a).unwrap_or(id);
+                    if let Some(p) = by_id.get(key) {
+                        chosen.push((*p).clone());
+                    }
+                }
+                (Some("erase"), Some(id)) => {
+                    return Err(SolveError::Unsatisfiable(format!("libsolv would remove {id}, which spk never does")));
+                }
+                _ => {}
+            }
+        }
+        Ok(Solver::order_packages(&chosen))
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn p(name: &str, version: &str, depends: &str) -> Pkg {
+            Pkg::new(name, version, depends, "", "")
+        }
+
+        fn uni(available: Vec<Pkg>, installed: Vec<Pkg>) -> Universe {
+            Universe { available, installed }
+        }
+
+        fn names(r: Result<Vec<Pkg>, SolveError>) -> Vec<String> {
+            r.expect("solve failed").into_iter().map(|p| p.name).collect()
+        }
+
+        fn want(n: &str) -> Vec<Vec<Dep>> {
+            vec![vec![super::super::resolver::parse_dep(n).unwrap()]]
+        }
+
+        #[test]
+        fn installs_dependencies_first() {
+            let u = uni(vec![p("app", "1.0-1", "lib (>= 1.0)"), p("lib", "1.2-3", "")], vec![]);
+            assert_eq!(names(solve(&u, &want("app"))), vec!["lib", "app"]);
+        }
+
+        #[test]
+        fn skips_installed_packages() {
+            let u = uni(vec![p("app", "1.0-1", "lib"), p("lib", "1.0-1", "")], vec![p("lib", "1.0-1", "")]);
+            assert_eq!(names(solve(&u, &want("app"))), vec!["app"]);
+        }
+
+        #[test]
+        fn picks_the_newest_satisfying_version() {
+            let u = uni(vec![p("lib", "1.0-1", ""), p("lib", "2.0-1", ""), p("app", "1-1", "lib (<< 2.0)")], vec![]);
+            let r = solve(&u, &want("app")).unwrap();
+            assert!(r.iter().any(|x| x.name == "lib" && x.version == "1.0-1"));
+        }
+
+        #[test]
+        fn resolves_virtual_packages() {
+            let v = Pkg::new("real", "1.0-1", "", "virt", "");
+            let u = uni(vec![p("app", "1-1", "virt"), v], vec![]);
+            assert_eq!(names(solve(&u, &want("app"))), vec!["real", "app"]);
+        }
+
+        #[test]
+        fn missing_dependency_is_not_found() {
+            let u = uni(vec![p("app", "1-1", "ghost")], vec![]);
+            let r = solve(&u, &want("ghost"));
+            assert!(matches!(r, Err(SolveError::NotFound(_))), "{:?}", r.map(|v| v.len()));
+        }
+
+        #[test]
+        fn agrees_with_the_builtin_solver() {
+            let u = uni(
+                vec![p("a", "1-1", "b, c (>= 2)"), p("b", "1-1", "c"), p("c", "2.1-1", ""), p("c", "1.0-1", "")],
+                vec![],
+            );
+            let mine = names(solve(&u, &want("a")));
+            let theirs: Vec<String> = Solver::new(&u).solve(&want("a")).unwrap().into_iter().map(|p| p.name).collect();
+            assert_eq!(mine, theirs);
+        }
+    }
+}
+
+/// Pick the solver. libsolv is the default. SPK_SOLVER=builtin uses the older
+/// in-tree solver; SPK_SOLVER=compare runs both, reports differences on stderr
+/// and uses libsolv's answer. If libsolv itself fails to start (it could not
+/// load the package list, which says nothing about the dependencies), the
+/// in-tree solver answers so installs keep working.
+fn solve_with_backend(
+    uni: &resolver::Universe,
+    req: &[Vec<resolver::Dep>],
+) -> Result<Vec<resolver::Pkg>, resolver::SolveError> {
+    let builtin = || resolver::Solver::new(uni).solve(req);
+    match std::env::var("SPK_SOLVER").as_deref() {
+        Ok("builtin") => builtin(),
+        Ok("compare") => {
+            let b = libsolv_backend::solve(uni, req);
+            let a = builtin();
+            let names = |r: &Result<Vec<resolver::Pkg>, resolver::SolveError>| -> Option<Vec<String>> {
+                r.as_ref().ok().map(|v| v.iter().map(|p| format!("{} {}", p.name, p.version)).collect())
+            };
+            if names(&a) != names(&b) {
+                eprintln!("[spk] solver mismatch: built-in={:?} libsolv={:?}", names(&a), names(&b));
+            }
+            b
+        }
+        _ => match libsolv_backend::solve(uni, req) {
+            Err(resolver::SolveError::Unsatisfiable(m)) if m.starts_with("libsolv:") => {
+                eprintln!("[spk] {m}; using the built-in solver");
+                builtin()
+            }
+            r => r,
+        },
+    }
+}
+
 /// Candidate packages from the `index.meta` of every *trusted* repo. None when
 /// no trusted repo publishes one, in which case spk falls back to the older
 /// per-package resolver. Untrusted repos are deliberately not consulted: the
@@ -2296,7 +2609,7 @@ fn plan_install(request: &str, root: &str) -> Option<Result<Vec<resolver::Pkg>, 
         .map(|p| resolver::Pkg::new(&p.name, &p.version, &p.depends, &p.provides, &p.conflicts))
         .collect();
     let uni = resolver::Universe { available, installed };
-    match resolver::Solver::new(&uni).solve(&[vec![dep]]) {
+    match solve_with_backend(&uni, &[vec![dep]]) {
         Ok(plan) => Some(Ok(plan)),
         Err(resolver::SolveError::NotFound(_)) => None,
         Err(e) => Some(Err(e.message())),
