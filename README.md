@@ -1,4 +1,4 @@
-# spk -- Smech Sovereign Package Keeper
+# spk -- Smech Package Keeper
 
 `spk` is SmechOS's own package manager. It fetches pre-built packages
 from one or more configured repos and extracts them into the target root
@@ -8,7 +8,7 @@ package format.
 ## Commands
 
 ```
-spk install <pkg>                    Fetch and install a package from a configured repo
+spk install <pkg>... [--dry-run]     Fetch and install packages from a configured repo
 spk install --local-package <path>   Install a local .spkg file (the ONLY way to install
                                       from disk -- a bare path passed to 'install' is
                                       rejected on purpose, see ".spkg format" below)
@@ -18,7 +18,31 @@ spk remove <pkg> [-y] [--force]      Uninstall a package. Refuses if another ins
                                       package still depends on it (--force overrides).
                                       Never deletes a file another installed package
                                       also owns.
-spk list                             Show all installed packages
+spk list [--upgradable|--available|--auto|--manual|--held]
+                                      Show installed packages (or the filtered set)
+spk update                           Check every repo's index; count upgradable packages
+spk upgrade [pkg...] [-y] [-n]       Upgrade packages with a newer version. -n/--dry-run
+                                      only lists them. Held packages are skipped, and
+                                      files the old version had but the new one dropped
+                                      are deleted (unless another package owns them).
+spk reinstall <pkg>...               Fetch and install the same package again
+spk autoremove [-y] [-n]             Remove packages that were installed only as
+                                      dependencies and that nothing needs any more
+spk search <term>...                 Search installed and published packages (all terms)
+spk info <pkg>                       Versions, explicit/dependency status, dependencies,
+                                      what needs it
+spk files <pkg>                      List the files an installed package owns
+spk owns <path>                      Which installed package owns a file
+spk provides <name>                  Which packages provide a name (including virtual ones)
+spk mark-manual|mark-auto <pkg>      Change whether autoremove may remove a package
+spk hold|unhold <pkg>                Keep a package at its version during upgrade
+spk verify [pkg...] [-v]             Check that every file in the records is on disk
+spk check                            Report unmet dependencies and conflicts
+spk history                          The install/remove/upgrade log
+spk download <pkg>...                Save .spkg files without installing
+spk clean                            Delete leftover partial downloads from /tmp
+spk repo list|add|remove             Show or change the configured repos (add takes
+                                      --priority N and --key /path/key.pub)
 spk depends <pkg>                    Show a package's dependency tree
 spk create-live-image <out.iso>      Build a bootable image straight from a repo's
                                       published packages, not from source (needs a
@@ -41,6 +65,21 @@ tool (`spk-compile.py`). `build-image` is the new name for that old
 behavior; `compile` is now the real thing. If you're looking for the
 former `spk compile smechos` / `spk compile iso smechos` / etc., that's
 `spk build-image smechos` / `spk build-image iso smechos` now.
+
+### Day-to-day package management
+
+`install` marks the packages you name as explicitly installed and everything
+it pulls in as a dependency (`[auto]` in `spk list`). `autoremove` only ever
+removes dependency-marked packages that no explicitly installed package still
+needs, so everything already in an image (which has no marks) is left alone.
+The marks, the hold list and the history live next to the installed-package
+records, under `/var/lib/spk/` (`auto-installed`, `held`, `history.log`).
+
+Not here yet: transaction rollback (`history` is a log, not an undo), package
+groups, configuration-file tracking (so `purge` is the same as `remove`),
+file checksums in the records (so `verify` finds missing files, not changed
+ones), and a local copy of the repo index (indexes are read on demand, so
+`update` verifies them rather than downloading them).
 
 `system-install`/`userland-install`/`entire-system-upgrade` still work as
 deprecated aliases for `install`/`system-upgrade` (v1.x compat), printing
@@ -245,6 +284,46 @@ repos:
     url: https://github.com/Smech-Labs/SmechDeploy/releases/download/v1.0.0-packages
     priority: 10
 ```
+
+### Signed repositories
+
+A repo entry can carry the Ed25519 public key its indexes are signed with.
+This is how a personal or third-party repo is trusted, the same way you add a
+signing key for an APT repository:
+
+```
+require_signed: false          # true = refuse any non-file:// repo that has no key
+repos:
+  - name: smech
+    url: https://pkg.smech.xyz
+    priority: 1
+    key: /etc/spk/keys/smech.pub     # PEM public key (openssl pkey -pubout)
+    max_index_age_days: 14           # refuse an index older than this (default 14)
+```
+
+With a `key`, `spk` verifies the repo and **fails closed**:
+
+* `index.meta` must have a valid `index.meta.sig` (Ed25519, raw, made with
+  `openssl pkeyutl -sign -rawin` over `smechbuild-v1\nindex\nindex.meta\n<sha256>\n`;
+  `smechbuild` produces this);
+* the index must carry a recent `generated:` timestamp and must never be older
+  than one already seen (stored under `/var/lib/spk/index-generated/`, or
+  `$SPK_STATE_DIR`), which stops freeze and rollback attacks;
+* every package is checked against the `sha256` the signed index pins, so a
+  compromised mirror cannot swap a file;
+* the dependency solver installs exactly the (repo, version) it planned;
+* if a signed repo fails any of this, `spk` **stops**. It does not fall back to
+  another repo or to the legacy `.tar.xz` format, because a lower-priority
+  unsigned repo could otherwise serve a same-named package.
+
+A repo with no `key` is *unsigned*: it keeps working (with a warning for
+non-`file://` repos) unless `require_signed: true` or `SPK_REQUIRE_SIGNED=1`
+is set. `file://` repos are exempt, since a directory on your own machine is
+yours. A configured key that cannot be read is an error, never "unsigned".
+Legacy `.tar.xz` bundles carry no hash pin and are not accepted from signed repos.
+
+`spk repo-status` shows each repo's policy and whether its index verifies right
+now (exit 1 if a keyed repo is rejected).
 
 Currently published (see `SMECHOS_PACKAGES` in `src/main.rs`, used by
 `system-upgrade` to know what to re-fetch -- `install` can fetch any name,

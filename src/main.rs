@@ -235,6 +235,9 @@ mod resolver {
         pub depends: Vec<Vec<Dep>>,
         pub provides: Vec<(String, Option<String>)>,
         pub conflicts: Vec<Dep>,
+        /// Name of the configured repo this candidate came from ("" for
+        /// installed packages and in tests). Installs fetch from exactly this repo.
+        pub repo: String,
     }
 
     impl Pkg {
@@ -245,6 +248,7 @@ mod resolver {
                 depends: parse_depends(depends),
                 provides: parse_provides(provides),
                 conflicts: parse_conflicts(conflicts),
+                repo: String::new(),
             }
         }
 
@@ -784,18 +788,45 @@ const NIX2SPK_PUBKEY: &str = "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEA/B2iaP
 // first, since silently falling back to an operator-marked-untrusted source
 // is exactly the kind of thing CONTRIBUTING.md's security section warns
 // against normalizing.
+//
+// Signing. A repo entry may carry `key: /path/to/archive.pub`, the PEM
+// Ed25519 public key its indexes are signed with. Such a repo is verified
+// strictly and fails closed (see "Repository trust" below). A repo without
+// a key is *unsigned*: it still works, with a warning, unless
+// `require_signed: true` is set (top level, or on the entry) or
+// SPK_REQUIRE_SIGNED is in the environment. `file://` repos are exempt from
+// require_signed: a directory on this machine is the operator's own.
 struct Repo {
     name: String,
     url: String,
     priority: u8,
+    /// Where the public key was read from (kept so the config can be rewritten).
+    key_path: Option<String>,
+    /// The PEM text of the key; Err = the configured key file is unusable,
+    /// which makes the repo unusable rather than silently unsigned.
+    key: Result<Option<String>, String>,
+    require_signed: bool,
+    max_index_age_days: u64,
 }
 
+impl Repo {
+    fn unsigned(name: &str, url: &str, priority: u8) -> Repo {
+        Repo {
+            name: name.to_string(),
+            url: url.to_string(),
+            priority,
+            key_path: None,
+            key: Ok(None),
+            require_signed: false,
+            max_index_age_days: DEFAULT_MAX_INDEX_AGE_DAYS,
+        }
+    }
+}
+
+const DEFAULT_MAX_INDEX_AGE_DAYS: u64 = 14;
+
 fn default_repos() -> Vec<Repo> {
-    vec![Repo {
-        name: "default".to_string(),
-        url: DEFAULT_RELEASE_URL.to_string(),
-        priority: 1,
-    }]
+    vec![Repo::unsigned("default", DEFAULT_RELEASE_URL, 1)]
 }
 
 fn parse_repo_conf(text: &str) -> Vec<Repo> {
@@ -805,6 +836,7 @@ fn parse_repo_conf(text: &str) -> Vec<Repo> {
     };
     let Some(doc) = docs.first() else { return Vec::new() };
     let Some(entries) = doc["repos"].as_vec() else { return Vec::new() };
+    let global_require = doc["require_signed"].as_bool().unwrap_or(false);
 
     let mut repos = Vec::new();
     for entry in entries {
@@ -815,13 +847,48 @@ fn parse_repo_conf(text: &str) -> Vec<Repo> {
             .as_i64()
             .and_then(|p| u8::try_from(p).ok())
             .unwrap_or(50);
+        let key_path = entry["key"].as_str().map(|s| s.to_string());
+        let key = match &key_path {
+            None => Ok(None),
+            Some(path) => match fs::read_to_string(path) {
+                Ok(pem) if pem.contains("BEGIN PUBLIC KEY") => Ok(Some(pem)),
+                Ok(_) => Err(format!("key file {path} is not a PEM public key")),
+                Err(e) => Err(format!("cannot read key file {path}: {e}")),
+            },
+        };
         repos.push(Repo {
             name: name.to_string(),
             url: url.to_string(),
             priority,
+            key_path,
+            key,
+            require_signed: entry["require_signed"].as_bool().unwrap_or(global_require),
+            max_index_age_days: entry["max_index_age_days"]
+                .as_i64()
+                .and_then(|d| u64::try_from(d).ok())
+                .filter(|d| *d > 0)
+                .unwrap_or(DEFAULT_MAX_INDEX_AGE_DAYS),
         });
     }
     repos
+}
+
+/// The repo config as YAML, preserving signing settings.
+fn repos_to_yaml(repos: &[Repo]) -> String {
+    let mut out = String::from("repos:\n");
+    for r in repos {
+        out.push_str(&format!("  - name: {}\n    url: {}\n    priority: {}\n", r.name, r.url, r.priority));
+        if let Some(k) = &r.key_path {
+            out.push_str(&format!("    key: {k}\n"));
+        }
+        if r.require_signed {
+            out.push_str("    require_signed: true\n");
+        }
+        if r.max_index_age_days != DEFAULT_MAX_INDEX_AGE_DAYS {
+            out.push_str(&format!("    max_index_age_days: {}\n", r.max_index_age_days));
+        }
+    }
+    out
 }
 
 fn load_repos() -> Vec<Repo> {
@@ -837,6 +904,11 @@ fn load_repos() -> Vec<Repo> {
                 repos = default_repos();
             }
             repos.sort_by_key(|r| r.priority);
+            if env::var("SPK_REQUIRE_SIGNED").is_ok() {
+                for r in &mut repos {
+                    r.require_signed = true;
+                }
+            }
             repos
         }
         Err(_) => default_repos(),
@@ -849,11 +921,306 @@ fn load_repos() -> Vec<Repo> {
 /// A repo's `url` can be `file:///abs/path` (see `local-package-repo`) as
 /// well as http(s) -- curl handles both transparently, so this needed no
 /// new fetch logic of its own.
+// ── Repository trust ──────────────────────────────────────────────────────────
+//
+// A repo with a `key:` is verified the way APT verifies a signed Release file,
+// and fails closed:
+//   * index.meta must carry a valid Ed25519 signature (index.meta.sig) from
+//     that key, over "smechbuild-v1\nindex\nindex.meta\n<sha256>\n";
+//   * it must be fresh (its `generated` header no older than
+//     max_index_age_days) and never older than one already seen (rollback);
+//   * every package is checked against the sha256 the signed index pins, so a
+//     compromised mirror or web server cannot substitute a file.
+// If a signed repo fails any of this, spk stops: it does NOT fall back to
+// another repo for that package, because a lower-priority unsigned repo could
+// then serve a same-named package (dependency confusion).
+
+#[derive(Clone, Debug)]
+enum IndexError {
+    /// Could not be fetched; another repo may be tried.
+    Unreachable(String),
+    /// Fetched but not acceptable. Callers must stop, not fall back.
+    Untrusted(String),
+}
+
+#[derive(Debug)]
+struct VerifiedIndex {
+    meta: String,
+    /// (name, version) -> sha256. Authenticated only when `signed`.
+    pins: HashMap<(String, String), String>,
+    latest: HashMap<String, String>,
+    generated: Option<u64>,
+    signed: bool,
+}
+
+enum TrustError {
+    /// Misconfigured key: stop, do not guess.
+    Broken(String),
+    /// This repo may not be used under the current policy; others still may.
+    Disallowed(String),
+}
+
+enum Trust<'a> {
+    Signed(&'a str),
+    Unsigned,
+}
+
+fn is_file_url(url: &str) -> bool {
+    url.starts_with("file://")
+}
+
+fn trust_of(repo: &Repo) -> Result<Trust<'_>, TrustError> {
+    match &repo.key {
+        Err(e) => Err(TrustError::Broken(e.clone())),
+        Ok(Some(pem)) => Ok(Trust::Signed(pem)),
+        Ok(None) if repo.require_signed && !is_file_url(&repo.url) => Err(TrustError::Disallowed(format!(
+            "repo '{}' has no `key:` and signatures are required (SPK_REQUIRE_SIGNED / require_signed)",
+            repo.name
+        ))),
+        Ok(None) => Ok(Trust::Unsigned),
+    }
+}
+
+/// What the archive key signs for an index file. Must stay byte-identical to
+/// smechbuild's signing.index_message().
+fn index_signing_message(filename: &str, sha256_hex: &str) -> Vec<u8> {
+    format!("smechbuild-v1\nindex\n{filename}\n{sha256_hex}\n").into_bytes()
+}
+
+fn sha256_hex_of_bytes(data: &[u8]) -> Option<String> {
+    let mut child = Command::new("openssl")
+        .args(["dgst", "-sha256", "-r"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    child.stdin.take()?.write_all(data).ok()?;
+    let out = child.wait_with_output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&out.stdout).split_whitespace().next().map(|s| s.to_string())
+}
+
+/// The `generated:` unix time from index.meta's header stanza.
+fn index_generated(text: &str) -> Option<u64> {
+    let head = text.split("\n\n").next()?;
+    head.lines()
+        .find_map(|l| l.strip_prefix("generated:"))
+        .and_then(|v| v.trim().parse::<u64>().ok())
+}
+
+fn parse_index_pins(text: &str) -> (HashMap<(String, String), String>, HashMap<String, String>) {
+    let mut pins = HashMap::new();
+    let mut latest: HashMap<String, String> = HashMap::new();
+    for stanza in text.split("\n\n") {
+        let mut f: HashMap<&str, &str> = HashMap::new();
+        for line in stanza.lines() {
+            if let Some((k, v)) = line.split_once(':') {
+                f.insert(k.trim(), v.trim());
+            }
+        }
+        let (Some(name), Some(version)) = (f.get("name"), f.get("version")) else { continue };
+        if let Some(sha) = f.get("sha256") {
+            pins.insert((name.to_string(), version.to_string()), sha.to_string());
+        }
+        let newer = match latest.get(*name) {
+            Some(cur) => resolver::compare_versions(version, cur) == std::cmp::Ordering::Greater,
+            None => true,
+        };
+        if newer {
+            latest.insert(name.to_string(), version.to_string());
+        }
+    }
+    (pins, latest)
+}
+
+fn state_dir() -> std::path::PathBuf {
+    std::path::PathBuf::from(env::var("SPK_STATE_DIR").unwrap_or_else(|_| "/var/lib/spk".to_string()))
+}
+
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Verify a signed index. Pure apart from reading/writing the rollback marker
+/// under `state_dir`, so it is testable without a network.
+fn check_signed_index(
+    repo: &Repo,
+    pem: &str,
+    meta: &[u8],
+    sig: &str,
+    now: u64,
+    state_dir: &Path,
+) -> Result<VerifiedIndex, IndexError> {
+    let untrusted = |m: String| IndexError::Untrusted(m);
+    let Some(hash) = sha256_hex_of_bytes(meta) else {
+        return Err(untrusted("cannot hash index.meta (is openssl installed?)".into()));
+    };
+    if !verify_signature(pem, &index_signing_message("index.meta", &hash), sig.trim()) {
+        return Err(untrusted("index.meta signature is invalid (wrong key, or the file was altered)".into()));
+    }
+    let text = String::from_utf8(meta.to_vec()).map_err(|_| untrusted("index.meta is not UTF-8".into()))?;
+    let Some(generated) = index_generated(&text) else {
+        return Err(untrusted("signed index.meta has no `generated` timestamp".into()));
+    };
+    if generated > now + 86_400 {
+        return Err(untrusted("index.meta claims to be generated in the future (clock wrong, or forged)".into()));
+    }
+    let max_age = repo.max_index_age_days * 86_400;
+    if now.saturating_sub(generated) > max_age {
+        return Err(untrusted(format!(
+            "index.meta is stale: generated {} day(s) ago, limit {} (the archive stopped re-signing, or a mirror serves old data)",
+            now.saturating_sub(generated) / 86_400,
+            repo.max_index_age_days
+        )));
+    }
+    let marker_dir = state_dir.join("index-generated");
+    let safe: String = repo.name.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '_' }).collect();
+    let marker = marker_dir.join(safe);
+    if let Some(seen) = fs::read_to_string(&marker).ok().and_then(|t| t.trim().parse::<u64>().ok()) {
+        if generated < seen {
+            return Err(untrusted(format!(
+                "index.meta (generated {generated}) is older than one already seen ({seen}): possible rollback"
+            )));
+        }
+    }
+    if fs::create_dir_all(&marker_dir).is_ok() {
+        let _ = fs::write(&marker, generated.to_string());
+    }
+    let (pins, latest) = parse_index_pins(&text);
+    Ok(VerifiedIndex { meta: text, pins, latest, generated: Some(generated), signed: true })
+}
+
+fn fetch_bytes(url: &str) -> Result<Vec<u8>, String> {
+    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let tmp = format!(
+        "/tmp/spk-fetch-{}-{}",
+        std::process::id(),
+        N.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+    );
+    let ok = Command::new("curl")
+        .args(["-sfL", "--max-time", "120", "-o", &tmp, url])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    let data = if ok { fs::read(&tmp).map_err(|e| e.to_string()) } else { Err(format!("cannot fetch {url}")) };
+    let _ = fs::remove_file(&tmp);
+    data
+}
+
+thread_local! {
+    static INDEX_CACHE: std::cell::RefCell<HashMap<String, Result<std::rc::Rc<VerifiedIndex>, IndexError>>> =
+        std::cell::RefCell::new(HashMap::new());
+    static WARNED: std::cell::RefCell<std::collections::HashSet<String>> =
+        std::cell::RefCell::new(std::collections::HashSet::new());
+    /// name -> (repo, version) the solver chose for this run: installs fetch
+    /// exactly that package from exactly that repo.
+    static PLANNED: std::cell::RefCell<HashMap<String, (String, String)>> =
+        std::cell::RefCell::new(HashMap::new());
+    /// Set when the last fetch was refused for a trust reason (bad signature,
+    /// hash mismatch, broken key). Callers must then stop, not try another
+    /// format or repo.
+    static TRUST_REFUSED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn refuse_trust() -> bool {
+    TRUST_REFUSED.with(|f| f.set(true));
+    false
+}
+
+/// The (verified, if the repo has a key) index of `repo`, fetched at most once per run.
+fn verified_index(repo: &Repo) -> Result<std::rc::Rc<VerifiedIndex>, IndexError> {
+    let key = format!("{}|{}", repo.name, repo.url);
+    if let Some(hit) = INDEX_CACHE.with(|c| c.borrow().get(&key).cloned()) {
+        return hit;
+    }
+    let result = (|| {
+        let base = repo.url.trim_end_matches('/');
+        let trust = match trust_of(repo) {
+            Ok(t) => t,
+            Err(TrustError::Broken(m)) => return Err(IndexError::Untrusted(m)),
+            Err(TrustError::Disallowed(m)) => return Err(IndexError::Untrusted(m)),
+        };
+        let meta = fetch_bytes(&format!("{base}/index.meta")).map_err(IndexError::Unreachable)?;
+        match trust {
+            Trust::Signed(pem) => {
+                let sig = fetch_bytes(&format!("{base}/index.meta.sig"))
+                    .map_err(|_| IndexError::Untrusted("this repo is configured with a key but serves no index.meta.sig".into()))?;
+                let sig = String::from_utf8_lossy(&sig).to_string();
+                check_signed_index(repo, pem, &meta, &sig, now_unix(), &state_dir()).map(std::rc::Rc::new)
+            }
+            Trust::Unsigned => {
+                if !is_file_url(&repo.url) {
+                    WARNED.with(|w| {
+                        if w.borrow_mut().insert(repo.name.clone()) {
+                            println!(
+                                "{YELLOW}[spk] WARNING: repo '{}' is not signed; its contents are not verified. \
+                                 Add `key:` to its entry in {REPO_CONF_PATH}.{R}",
+                                repo.name
+                            );
+                        }
+                    });
+                }
+                let text = String::from_utf8_lossy(&meta).to_string();
+                let (_pins, latest) = parse_index_pins(&text);
+                Ok(std::rc::Rc::new(VerifiedIndex {
+                    generated: index_generated(&text),
+                    meta: text,
+                    pins: HashMap::new(),
+                    latest,
+                    signed: false,
+                }))
+            }
+        }
+    })();
+    INDEX_CACHE.with(|c| c.borrow_mut().insert(key, result.clone()));
+    result
+}
+
+/// Version recorded in an .spkg's control file.
+fn spkg_control_version(path: &str) -> Option<String> {
+    let outer = Command::new("tar").args(["-xOf", path, "control.tar.xz"]).output().ok()?;
+    if !outer.status.success() {
+        return None;
+    }
+    let mut child = Command::new("tar")
+        .args(["-xJOf", "-", "--wildcards", "*control"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    child.stdin.take()?.write_all(&outer.stdout).ok()?;
+    let out = child.wait_with_output().ok()?;
+    let meta = parse_control(&String::from_utf8_lossy(&out.stdout));
+    if meta.version.is_empty() { None } else { Some(meta.version) }
+}
+
+fn curl_to(url: &str, dest: &str) -> bool {
+    Command::new("curl")
+        .args(["-sfL", "-o", dest, url])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
 fn fetch_package_ext(pkg: &str, ext: &str, dest_tmp: &str) -> bool {
+    TRUST_REFUSED.with(|f| f.set(false));
+    let planned = PLANNED.with(|p| p.borrow().get(pkg).cloned());
     let repos = load_repos();
     let (trusted, untrusted): (Vec<_>, Vec<_>) = repos.iter().partition(|r| r.priority < 100);
 
     for repo in trusted.iter().chain(untrusted.iter()) {
+        if let Some((planned_repo, _)) = &planned {
+            if &repo.name != planned_repo {
+                continue;
+            }
+        }
         if repo.priority >= 100 {
             println!(
                 "{RED}{BOLD}[spk] WARNING: falling back to untrusted repo '{}' ({}) -- \
@@ -861,13 +1228,106 @@ fn fetch_package_ext(pkg: &str, ext: &str, dest_tmp: &str) -> bool {
                 repo.name, repo.url
             );
         }
-        let url = format!("{}/{pkg}.{ext}", repo.url.trim_end_matches('/'));
-        let ok = Command::new("curl")
-            .args(["-sfL", "-o", dest_tmp, &url])
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
-        if ok {
+        let base = repo.url.trim_end_matches('/');
+        let trust = match trust_of(repo) {
+            Ok(t) => t,
+            Err(TrustError::Disallowed(m)) => {
+                println!("{YELLOW}[spk] Skipping: {m}{R}");
+                continue;
+            }
+            Err(TrustError::Broken(m)) => {
+                println!("{RED}{BOLD}[spk] Refusing to continue: repo '{}' is misconfigured: {m}{R}", repo.name);
+                return refuse_trust();
+            }
+        };
+
+        if let Trust::Signed(_) = trust {
+            if ext != "spkg" {
+                println!(
+                    "{YELLOW}[spk] Legacy .{ext} bundles carry no hash pin and are not accepted from \
+                     signed repo '{}'.{R}",
+                    repo.name
+                );
+                continue;
+            }
+            let vi = match verified_index(repo) {
+                Ok(v) => v,
+                Err(IndexError::Unreachable(_)) => continue,
+                Err(IndexError::Untrusted(m)) => {
+                    println!("{RED}{BOLD}[spk] Refusing {pkg}: repo '{}' failed verification: {m}{R}", repo.name);
+                    return refuse_trust();
+                }
+            };
+            let want = match &planned {
+                Some((_, v)) => v.clone(),
+                None => match vi.latest.get(pkg) {
+                    Some(v) => v.clone(),
+                    None => continue, // not in this repo; the next one may have it
+                },
+            };
+            let Some(pin) = vi.pins.get(&(pkg.to_string(), want.clone())) else {
+                if planned.is_some() {
+                    println!(
+                        "{RED}{BOLD}[spk] Refusing {pkg}: the plan needs {want} but the signed index of '{}' \
+                         does not list it.{R}",
+                        repo.name
+                    );
+                    return refuse_trust();
+                }
+                continue;
+            };
+            let url = if vi.latest.get(pkg) == Some(&want) {
+                format!("{base}/{pkg}.spkg")
+            } else {
+                format!("{base}/pool/{pkg}_{want}.spkg")
+            };
+            if !curl_to(&url, dest_tmp) {
+                let _ = fs::remove_file(dest_tmp);
+                println!(
+                    "{RED}{BOLD}[spk] Refusing {pkg}: the signed index of '{}' lists {want} but {url} could not \
+                     be fetched. Not falling back to another repo.{R}",
+                    repo.name
+                );
+                return refuse_trust();
+            }
+            if sha256_of_file(dest_tmp).as_deref() != Some(pin.as_str()) {
+                let _ = fs::remove_file(dest_tmp);
+                println!(
+                    "{RED}{BOLD}[spk] Refusing {pkg} {want}: the downloaded file does not match the sha256 \
+                     pinned in the signed index of '{}' (tampered or corrupted).{R}",
+                    repo.name
+                );
+                return refuse_trust();
+            }
+            println!("{GREEN}[spk] {pkg} {want} verified against the signed index of '{}'.{R}", repo.name);
+            return true;
+        }
+
+        // Unsigned repo: the old behavior, plus a version check when the solver chose one.
+        if !is_file_url(&repo.url) {
+            WARNED.with(|w| {
+                if w.borrow_mut().insert(repo.name.clone()) {
+                    println!(
+                        "{YELLOW}[spk] WARNING: repo '{}' is not signed; its contents are not verified.{R}",
+                        repo.name
+                    );
+                }
+            });
+        }
+        let url = format!("{base}/{pkg}.{ext}");
+        if curl_to(&url, dest_tmp) {
+            if let (Some((_, want)), "spkg") = (&planned, ext) {
+                if let Some(got) = spkg_control_version(dest_tmp) {
+                    if &got != want {
+                        println!(
+                            "{RED}[spk] '{}' serves {pkg} {got} but the plan needs {want}; not installing it.{R}",
+                            repo.name
+                        );
+                        let _ = fs::remove_file(dest_tmp);
+                        continue;
+                    }
+                }
+            }
             return true;
         }
         let _ = fs::remove_file(dest_tmp);
@@ -913,7 +1373,9 @@ fn print_help() {
     println!("{BOLD}USAGE:{R}  spk <COMMAND> [args...]");
     println!();
     println!("{BOLD}PACKAGE MANAGEMENT{R}");
-    println!("    {GREEN}install <pkg>{R}              Fetch and install a package from a repo");
+    println!("    {GREEN}install <pkg>...{R}           Fetch and install packages from a repo");
+    println!("                                     (--dry-run shows the plan only; packages pulled");
+    println!("                                     in as dependencies are marked [auto])");
     println!("    {GREEN}install --local-package <path>{R}  Install a local .spkg file (the only");
     println!("                                     way to install from disk -- a bare path");
     println!("                                     to 'install' is rejected on purpose)");
@@ -922,8 +1384,28 @@ fn print_help() {
     println!("    {GREEN}remove <pkg> [-y] [--force]{R}  Uninstall a package (checks reverse deps");
     println!("                                     and never deletes a file another");
     println!("                                     installed package also owns)");
-    println!("    {GREEN}list{R}                       Show all installed packages");
+    println!("    {GREEN}list{R}                       Show installed packages (--upgradable, --available,");
+    println!("                                     --auto, --manual, --held)");
+    println!("    {GREEN}update{R}                     Check every repo's index and count upgrades");
+    println!("    {GREEN}upgrade [pkg...] [-y] [-n]{R} Upgrade packages that have a newer version");
+    println!("                                     (-n/--dry-run lists them; held ones are skipped)");
+    println!("    {GREEN}reinstall <pkg>...{R}         Fetch and install the same package again");
+    println!("    {GREEN}autoremove [-y] [-n]{R}       Remove dependencies nothing needs any more");
+    println!("    {GREEN}search <term>...{R}           Search installed and published packages");
+    println!("    {GREEN}info <pkg>{R}                 Versions, status, dependencies, reverse deps");
+    println!("    {GREEN}files <pkg>{R}                List the files an installed package owns");
+    println!("    {GREEN}owns <path>{R}                Which installed package owns a file");
+    println!("    {GREEN}provides <name>{R}            Which packages provide a (virtual) name");
+    println!("    {GREEN}mark-manual|mark-auto <pkg>{R}  Change whether autoremove may remove it");
+    println!("    {GREEN}hold|unhold <pkg>{R}          Keep a package at its version during upgrade");
+    println!("    {GREEN}verify [pkg...] [-v]{R}       Check that every recorded file is on disk");
+    println!("    {GREEN}check{R}                      Look for unmet dependencies and conflicts");
+    println!("    {GREEN}history{R}                    Show the install/remove/upgrade log");
+    println!("    {GREEN}download <pkg>...{R}          Save .spkg files without installing");
+    println!("    {GREEN}clean{R}                      Delete leftover partial downloads");
+    println!("    {GREEN}repo list|add|remove{R}       Show or change the configured repos");
     println!("    {GREEN}depends <pkg>{R}              Show a package's dependency tree");
+    println!("    {GREEN}repo-status{R}                Show each repo's signing state and whether its index verifies");
     println!("    {GREEN}solve <pkg>{R}                Show what installing a package would do");
     println!("                                     (versions, alternatives, conflicts) without");
     println!("                                     installing; needs the repo's index.meta");
@@ -957,7 +1439,7 @@ fn print_help() {
 
 fn print_about() {
     print_banner();
-    println!("{BOLD}SPK -- Smech Sovereign Package Keeper{R}");
+    println!("{BOLD}SPK -- Smech Package Keeper{R}");
     println!("  Version:    {VERSION}");
     println!("  License:    MIT");
     println!("  Homepage:   {CYAN}{DOCS_URL}/smechos.html#spk{R}");
@@ -1128,6 +1610,10 @@ fn verify_signature(pubkey_pem: &str, message: &[u8], sig_b64: &str) -> bool {
                 "pkeyutl", "-verify", "-pubin", "-inkey", &pub_path,
                 "-rawin", "-in", &msg_path, "-sigfile", &sig_path,
             ])
+            // openssl chatters on stdout/stderr ("Signature Verified Successfully");
+            // that must never leak into machine-readable output such as `solve --porcelain`.
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
             .status()
             .map(|s| s.success())
             .unwrap_or(false);
@@ -1490,6 +1976,9 @@ fn list_installed_names(root: &str) -> Vec<String> {
         for e in entries.flatten() {
             if e.path().is_file() {
                 if let Some(n) = e.file_name().to_str() {
+                    if n.ends_with(".prerm") || n.ends_with(".postrm") {
+                        continue;
+                    }
                     names.push(n.to_string());
                 }
             }
@@ -1680,6 +2169,12 @@ fn fetch_and_install_inner(pkg: &str, root: &str, resolving: &mut Vec<String>) -
         return ok;
     }
     let _ = fs::remove_file(&spkg_tmp);
+    if TRUST_REFUSED.with(|f| f.get()) {
+        // A signed repo was refused (bad signature, hash mismatch, ...). Trying the
+        // legacy format or another repo would be a downgrade, so stop here.
+        println!("{RED}[spk] Not trying any other format or repo for {pkg}.{R}");
+        return false;
+    }
 
     // Legacy bare .tar.xz fallback for repos that haven't migrated to
     // .spkg yet -- kept deliberately during the transition rather than a
@@ -1751,29 +2246,32 @@ fn fetch_and_install_inner(pkg: &str, root: &str, resolving: &mut Vec<String>) -
 /// per-package resolver. Untrusted repos are deliberately not consulted: the
 /// plan must only name packages that fetch_package_ext will fetch from a
 /// trusted repo.
-fn fetch_index_meta() -> Option<Vec<resolver::Pkg>> {
+fn fetch_index_meta() -> Result<Option<Vec<resolver::Pkg>>, String> {
     let mut all: Vec<resolver::Pkg> = Vec::new();
     for repo in load_repos().iter().filter(|r| r.priority < 100) {
-        let tmp = format!("/tmp/spk-meta-{}.txt", std::process::id());
-        let url = format!("{}/index.meta", repo.url.trim_end_matches('/'));
-        let ok = Command::new("curl")
-            .args(["-sfL", "-o", &tmp, &url])
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
-        if !ok {
-            let _ = fs::remove_file(&tmp);
-            continue;
+        match trust_of(repo) {
+            Ok(_) => {}
+            Err(TrustError::Disallowed(m)) => {
+                println!("{YELLOW}[spk] Skipping: {m}{R}");
+                continue;
+            }
+            Err(TrustError::Broken(m)) => return Err(format!("repo '{}' is misconfigured: {m}", repo.name)),
         }
-        let text = fs::read_to_string(&tmp).unwrap_or_default();
-        let _ = fs::remove_file(&tmp);
-        for p in resolver::parse_index_meta(&text) {
+        let vi = match verified_index(repo) {
+            Ok(v) => v,
+            Err(IndexError::Unreachable(_)) => continue,
+            Err(IndexError::Untrusted(m)) => {
+                return Err(format!("repo '{}' failed verification: {m}", repo.name));
+            }
+        };
+        for mut p in resolver::parse_index_meta(&vi.meta) {
             if !all.iter().any(|q| q.name == p.name && q.version == p.version) {
+                p.repo = repo.name.clone();
                 all.push(p);
             }
         }
     }
-    if all.is_empty() { None } else { Some(all) }
+    Ok(if all.is_empty() { None } else { Some(all) })
 }
 
 /// Solve `request` against the repo metadata and the installed set.
@@ -1787,7 +2285,11 @@ fn plan_install(request: &str, root: &str) -> Option<Result<Vec<resolver::Pkg>, 
         return None;
     }
     let dep = resolver::parse_dep(request)?;
-    let available = fetch_index_meta()?;
+    let available = match fetch_index_meta() {
+        Ok(Some(a)) => a,
+        Ok(None) => return None,
+        Err(e) => return Some(Err(e)),
+    };
     let installed: Vec<resolver::Pkg> = list_installed_names(root)
         .iter()
         .filter_map(|n| read_installed(root, n))
@@ -1806,6 +2308,47 @@ fn describe_plan(plan: &[resolver::Pkg]) -> String {
         .map(|p| format!("{} {}", p.name, p.version))
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+/// `spk repo-status`: for every configured repo, say whether it is signed and
+/// whether its index verifies right now. Exit status 1 if any repo that has a
+/// key fails verification.
+fn cmd_repo_status() {
+    let mut bad = false;
+    for repo in load_repos() {
+        let policy = match trust_of(&repo) {
+            Ok(Trust::Signed(_)) => format!("signed (key {})", repo.key_path.clone().unwrap_or_default()),
+            Ok(Trust::Unsigned) => "unsigned".to_string(),
+            Err(TrustError::Disallowed(m)) => {
+                println!("{YELLOW}{:<14}{R} {} -- {m}", repo.name, repo.url);
+                continue;
+            }
+            Err(TrustError::Broken(m)) => {
+                println!("{RED}{:<14}{R} {} -- BROKEN: {m}", repo.name, repo.url);
+                bad = true;
+                continue;
+            }
+        };
+        print!("{BOLD}{:<14}{R} {} [{policy}, priority {}] ", repo.name, repo.url, repo.priority);
+        match verified_index(&repo) {
+            Ok(vi) => {
+                let age = vi
+                    .generated
+                    .map(|g| format!(", generated {} h ago", now_unix().saturating_sub(g) / 3600))
+                    .unwrap_or_default();
+                let tag = if vi.signed { format!("{GREEN}verified{R}") } else { format!("{YELLOW}NOT verified{R}") };
+                println!("-> {tag}: {} package(s){age}", vi.latest.len());
+            }
+            Err(IndexError::Unreachable(m)) => println!("-> {YELLOW}unreachable{R}: {m}"),
+            Err(IndexError::Untrusted(m)) => {
+                println!("-> {RED}{BOLD}REJECTED{R}: {m}");
+                bad = true;
+            }
+        }
+    }
+    if bad {
+        exit(1);
+    }
 }
 
 /// `spk solve <pkg>`: show what an install would do, without installing.
@@ -1862,6 +2405,16 @@ fn cmd_install(pkg: &str) {
         }
         Some(Ok(plan)) if !plan.is_empty() => {
             println!("{CYAN}[spk] Resolved {} package(s): {}{R}", plan.len(), describe_plan(&plan));
+            PLANNED.with(|m| {
+                let mut m = m.borrow_mut();
+                m.clear();
+                for p in &plan {
+                    if !p.repo.is_empty() {
+                        m.insert(p.name.clone(), (p.repo.clone(), p.version.clone()));
+                    }
+                }
+            });
+            let before: std::collections::HashSet<String> = list_installed_names(root).into_iter().collect();
             for p in &plan {
                 let mut marker = vec![SOLVED_MARKER.to_string()];
                 if !fetch_and_install_inner(&p.name, root, &mut marker) {
@@ -1869,36 +2422,34 @@ fn cmd_install(pkg: &str) {
                     exit(1);
                 }
             }
+            for p in &plan {
+                if p.name == pkg {
+                    set_auto_mark(root, &p.name, false);
+                } else if !before.contains(&p.name) {
+                    set_auto_mark(root, &p.name, true);
+                }
+            }
+            log_history(root, "install", &describe_plan(&plan));
             println!("{GREEN}{BOLD}[spk] {pkg} installed successfully.{R}");
             return;
         }
         // Empty plan (already installed, so reinstall as before) or no metadata:
         _ => {}
     }
+    let before_fb: std::collections::HashSet<String> = list_installed_names(target_root()).into_iter().collect();
     if !fetch_and_install(pkg, target_root()) {
         println!("{RED}{BOLD}[spk] Installation failed for {pkg}.{R}");
         exit(1);
     }
-    println!("{GREEN}{BOLD}[spk] {pkg} installed successfully.{R}");
-}
-
-fn cmd_list() {
-    let root = target_root();
-    let names = list_installed_names(root);
-    if names.is_empty() {
-        println!(
-            "{YELLOW}[spk] No packages installed (or {} doesn't exist yet).{R}",
-            installed_db_dir(root)
-        );
-        return;
-    }
-    println!("{BOLD}Installed packages ({}){R}", names.len());
-    for name in &names {
-        if let Some(p) = read_installed(root, name) {
-            let badge = if is_nix_package(&p.name) { format!(" {YELLOW}[nix]{R}") } else { String::new() };
-            println!("  {GREEN}{}{R}  {}{badge}", p.name, p.version);
+    for n in list_installed_names(target_root()) {
+        if n == pkg {
+            set_auto_mark(target_root(), &n, false);
+        } else if !before_fb.contains(&n) {
+            set_auto_mark(target_root(), &n, true);
         }
     }
+    log_history(target_root(), "install", pkg);
+    println!("{GREEN}{BOLD}[spk] {pkg} installed successfully.{R}");
 }
 
 fn cmd_depends(name: &str) {
@@ -2033,6 +2584,8 @@ fn cmd_remove(name: &str, force: bool, yes: bool) {
     remove_root_file(&prerm_path);
     remove_root_file(&postrm_path);
     remove_root_file(&installed_db_path(root, name));
+    set_auto_mark(root, name, false);
+    log_history(root, "remove", &format!("{} {}", pkg.name, pkg.version));
     println!("{GREEN}[spk] {} removed.{R}", pkg.name);
 }
 
@@ -2070,20 +2623,10 @@ fn cmd_local_package_repo(folder: &str) {
     // Replace any existing "local" entry rather than accumulating
     // duplicates -- only one local-package-repo is active at a time.
     repos.retain(|r| r.name != "local");
-    repos.push(Repo {
-        name: "local".to_string(),
-        url,
-        priority: 1,
-    });
+    repos.push(Repo::unsigned("local", &url, 1));
     repos.sort_by_key(|r| r.priority);
 
-    let mut out = String::from("repos:\n");
-    for r in &repos {
-        out.push_str(&format!(
-            "  - name: {}\n    url: {}\n    priority: {}\n",
-            r.name, r.url, r.priority
-        ));
-    }
+    let out = repos_to_yaml(&repos);
 
     let write_ok = if is_root() {
         fs::write(REPO_CONF_PATH, &out).is_ok()
@@ -2134,6 +2677,802 @@ fn cmd_system_upgrade() {
     }
 }
 
+// ── apt/dnf-style commands ────────────────────────────────────────────────────
+//
+// Everything below works on the same installed-package records and repo
+// indexes as install/remove. The extra state it keeps lives next to the
+// records, under <root>/var/lib/spk/:
+//   auto-installed   packages that were pulled in only as dependencies
+//   held             packages `upgrade` must leave alone
+//   history.log      one line per install / remove / upgrade
+// Packages that were already in an image have no auto mark, so they count as
+// explicitly installed and `autoremove` never touches them.
+
+use std::collections::BTreeSet;
+
+fn spk_state_path(root: &str, name: &str) -> String {
+    format!("{}/var/lib/spk/{name}", root.trim_end_matches('/'))
+}
+
+fn ensure_parent_dir(path: &str) -> bool {
+    match Path::new(path).parent() {
+        Some(d) if !d.as_os_str().is_empty() => ensure_root_dir(&d.to_string_lossy()),
+        _ => true,
+    }
+}
+
+fn read_name_set(path: &str) -> BTreeSet<String> {
+    fs::read_to_string(path)
+        .map(|t| {
+            t.lines()
+                .map(|l| l.trim().to_string())
+                .filter(|l| !l.is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn write_name_set(path: &str, set: &BTreeSet<String>) -> bool {
+    if !ensure_parent_dir(path) {
+        return false;
+    }
+    let mut out = String::new();
+    for n in set {
+        out.push_str(n);
+        out.push('\n');
+    }
+    write_root_file(path, &out)
+}
+
+fn set_auto_mark(root: &str, name: &str, auto: bool) {
+    let path = spk_state_path(root, "auto-installed");
+    let mut set = read_name_set(&path);
+    let changed = if auto { set.insert(name.to_string()) } else { set.remove(name) };
+    if changed {
+        write_name_set(&path, &set);
+    }
+}
+
+fn log_history(root: &str, action: &str, detail: &str) {
+    let stamp = Command::new("date")
+        .args(["-u", "+%Y-%m-%dT%H:%M:%SZ"])
+        .output()
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default();
+    let path = spk_state_path(root, "history.log");
+    let mut text = fs::read_to_string(&path).unwrap_or_default();
+    text.push_str(&format!("{stamp} {action} {detail}\n"));
+    if ensure_parent_dir(&path) {
+        write_root_file(&path, &text);
+    }
+}
+
+fn all_records(root: &str) -> Vec<InstalledPkg> {
+    list_installed_names(root)
+        .iter()
+        .filter_map(|n| read_installed(root, n))
+        .collect()
+}
+
+/// The newest published version of every package, across all trusted repos.
+fn latest_available() -> Result<Vec<resolver::Pkg>, String> {
+    let all = match fetch_index_meta()? {
+        Some(a) => a,
+        None => return Err("no configured repo publishes an index.meta".to_string()),
+    };
+    let mut best: HashMap<String, resolver::Pkg> = HashMap::new();
+    for p in all {
+        let keep_old = matches!(
+            best.get(&p.name),
+            Some(b) if resolver::compare_versions(&b.version, &p.version) != std::cmp::Ordering::Less
+        );
+        if !keep_old {
+            best.insert(p.name.clone(), p);
+        }
+    }
+    let mut v: Vec<resolver::Pkg> = best.into_values().collect();
+    v.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(v)
+}
+
+struct Upgrade {
+    name: String,
+    from: String,
+    to: resolver::Pkg,
+}
+
+fn find_upgrades(root: &str) -> Result<Vec<Upgrade>, String> {
+    let avail = latest_available()?;
+    let mut out = Vec::new();
+    for rec in all_records(root) {
+        // Legacy bundles recorded no real version, so there is nothing to compare.
+        if rec.version.starts_with("unknown") {
+            continue;
+        }
+        if let Some(p) = avail.iter().find(|p| p.name == rec.name) {
+            if resolver::compare_versions(&p.version, &rec.version) == std::cmp::Ordering::Greater {
+                out.push(Upgrade { name: rec.name.clone(), from: rec.version.clone(), to: p.clone() });
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn confirm(prompt: &str) -> bool {
+    print!("  {prompt} [y/N] ");
+    let _ = std::io::stdout().flush();
+    let mut answer = String::new();
+    let _ = std::io::stdin().read_line(&mut answer);
+    answer.trim().to_lowercase() == "y"
+}
+
+fn names_in(args: &[String]) -> Vec<String> {
+    args.iter().filter(|a| !a.starts_with('-')).cloned().collect()
+}
+
+fn has_flag(args: &[String], long: &str, short: &str) -> bool {
+    args.iter().any(|a| a == long || (!short.is_empty() && a == short))
+}
+
+/// `spk update`: verify every repo's index and say what could be upgraded.
+/// spk reads indexes on demand rather than keeping a local copy, so this is
+/// the check APT's `update` does for a fresh cache, not a download step.
+fn cmd_update() {
+    println!("{BOLD}[spk] Checking repository indexes...{R}");
+    match fetch_index_meta() {
+        Err(e) => {
+            println!("{RED}{BOLD}[spk] {e}{R}");
+            exit(1);
+        }
+        Ok(None) => println!("{YELLOW}[spk] No configured repo publishes an index.meta.{R}"),
+        Ok(Some(all)) => {
+            let names: std::collections::HashSet<&str> = all.iter().map(|p| p.name.as_str()).collect();
+            println!(
+                "{GREEN}[spk] {} version(s) of {} package(s) available.{R}",
+                all.len(),
+                names.len()
+            );
+        }
+    }
+    cmd_repo_status();
+    if let Ok(ups) = find_upgrades(target_root()) {
+        if ups.is_empty() {
+            println!("{GREEN}[spk] Everything is up to date.{R}");
+        } else {
+            println!("{CYAN}[spk] {} package(s) can be upgraded.   spk upgrade{R}", ups.len());
+        }
+    }
+}
+
+fn cmd_search(terms: &[String]) {
+    let terms = names_in(terms);
+    if terms.is_empty() {
+        println!("{RED}[spk] Error: specify a search term.   spk search <term>...{R}");
+        exit(1);
+    }
+    let root = target_root();
+    let avail = match latest_available() {
+        Ok(a) => a,
+        Err(e) => {
+            println!("{YELLOW}[spk] No repo index to search ({e}); showing installed packages only.{R}");
+            Vec::new()
+        }
+    };
+    let recs = all_records(root);
+    let upgrades: Vec<String> = find_upgrades(root).map(|u| u.into_iter().map(|x| x.name).collect()).unwrap_or_default();
+
+    let matches = |name: &str, provides: &str| -> bool {
+        let hay = format!("{} {}", name, provides).to_lowercase();
+        terms.iter().all(|t| hay.contains(&t.to_lowercase()))
+    };
+    let mut rows: BTreeSet<String> = BTreeSet::new();
+    for p in &avail {
+        let prov: Vec<String> = p.provides.iter().map(|(n, _)| n.clone()).collect();
+        if matches(&p.name, &prov.join(" ")) {
+            rows.insert(p.name.clone());
+        }
+    }
+    for r in &recs {
+        if matches(&r.name, &r.provides) {
+            rows.insert(r.name.clone());
+        }
+    }
+    if rows.is_empty() {
+        println!("{YELLOW}[spk] Nothing matches '{}'.{R}", terms.join(" "));
+        return;
+    }
+    for name in &rows {
+        let newest = avail.iter().find(|p| &p.name == name);
+        let installed = recs.iter().find(|r| &r.name == name);
+        let version = newest
+            .map(|p| p.version.clone())
+            .or_else(|| installed.map(|r| r.version.clone()))
+            .unwrap_or_default();
+        let badge = match installed {
+            Some(_) if upgrades.contains(name) => format!(" {YELLOW}[installed, upgradable]{R}"),
+            Some(_) => format!(" {CYAN}[installed]{R}"),
+            None => String::new(),
+        };
+        println!("  {GREEN}{name}{R}  {version}{badge}");
+    }
+}
+
+fn dep_groups_to_string(groups: &[Vec<resolver::Dep>]) -> String {
+    groups
+        .iter()
+        .map(|g| g.iter().map(|d| d.name.clone()).collect::<Vec<_>>().join(" | "))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn cmd_info(name: &str) {
+    let root = target_root();
+    let rec = read_installed(root, name);
+    let avail = latest_available().ok().and_then(|a| a.into_iter().find(|p| p.name == name));
+    if rec.is_none() && avail.is_none() {
+        println!("{RED}[spk] No package called '{name}' is installed or published.{R}");
+        exit(1);
+    }
+    let auto = read_name_set(&spk_state_path(root, "auto-installed"));
+    let held = read_name_set(&spk_state_path(root, "held"));
+    println!("{BOLD}Package:{R}    {name}");
+    match &rec {
+        Some(r) => println!("{BOLD}Installed:{R}  {}", r.version),
+        None => println!("{BOLD}Installed:{R}  no"),
+    }
+    if let Some(a) = &avail {
+        println!("{BOLD}Available:{R}  {} (repo {})", a.version, a.repo);
+    }
+    if rec.is_some() {
+        let how = if auto.contains(name) { "installed as a dependency" } else { "installed explicitly" };
+        let hold = if held.contains(name) { ", held" } else { "" };
+        println!("{BOLD}Status:{R}     {how}{hold}");
+    }
+    let depends = match (&rec, &avail) {
+        (Some(r), _) if !r.depends.is_empty() => r.depends.clone(),
+        (_, Some(a)) => dep_groups_to_string(&a.depends),
+        _ => String::new(),
+    };
+    if !depends.is_empty() {
+        println!("{BOLD}Depends:{R}    {depends}");
+    }
+    if let Some(r) = &rec {
+        if !r.provides.is_empty() {
+            println!("{BOLD}Provides:{R}   {}", r.provides);
+        }
+        if !r.conflicts.is_empty() {
+            println!("{BOLD}Conflicts:{R}  {}", r.conflicts);
+        }
+        println!("{BOLD}Files:{R}      {}", r.files.len());
+        let rdeps = find_dependents(root, name);
+        if !rdeps.is_empty() {
+            println!("{BOLD}Needed by:{R}  {}", rdeps.join(", "));
+        }
+    }
+}
+
+fn cmd_files(name: &str) {
+    match read_installed(target_root(), name) {
+        Some(r) => {
+            for f in &r.files {
+                println!("/{}", f.trim_start_matches('/'));
+            }
+        }
+        None => {
+            println!("{RED}[spk] '{name}' is not installed.{R}");
+            exit(1);
+        }
+    }
+}
+
+fn normalize_owned_path(p: &str) -> String {
+    p.trim_start_matches("./").trim_start_matches('/').to_string()
+}
+
+fn cmd_owns(path: &str) {
+    let want = normalize_owned_path(path);
+    let owners: Vec<String> = all_records(target_root())
+        .into_iter()
+        .filter(|r| r.files.iter().any(|f| normalize_owned_path(f) == want))
+        .map(|r| r.name)
+        .collect();
+    if owners.is_empty() {
+        println!("{YELLOW}[spk] No installed package owns /{want}.{R}");
+        exit(1);
+    }
+    for o in owners {
+        println!("{o}: /{want}");
+    }
+}
+
+fn cmd_provides(name: &str) {
+    let root = target_root();
+    let mut found = false;
+    for r in all_records(root) {
+        let provided: Vec<String> = resolver::parse_provides(&r.provides).into_iter().map(|(n, _)| n).collect();
+        if r.name == name || provided.iter().any(|p| p == name) {
+            println!("{GREEN}{}{R}  {}  (installed)", r.name, r.version);
+            found = true;
+        }
+    }
+    if let Ok(avail) = latest_available() {
+        for p in avail {
+            if (p.name == name || p.provides.iter().any(|(n, _)| n == name))
+                && !is_installed(root, &p.name)
+            {
+                println!("{GREEN}{}{R}  {}  (available, repo {})", p.name, p.version, p.repo);
+                found = true;
+            }
+        }
+    }
+    if !found {
+        println!("{YELLOW}[spk] Nothing provides '{name}'.{R}");
+        exit(1);
+    }
+}
+
+fn cmd_list(args: &[String]) {
+    let root = target_root();
+    if has_flag(args, "--available", "") {
+        match latest_available() {
+            Ok(avail) => {
+                println!("{BOLD}Available packages ({}){R}", avail.len());
+                for p in avail {
+                    println!("  {GREEN}{}{R}  {}  (repo {})", p.name, p.version, p.repo);
+                }
+            }
+            Err(e) => {
+                println!("{RED}[spk] {e}{R}");
+                exit(1);
+            }
+        }
+        return;
+    }
+    if has_flag(args, "--upgradable", "") {
+        match find_upgrades(root) {
+            Ok(ups) => {
+                println!("{BOLD}Upgradable packages ({}){R}", ups.len());
+                for u in ups {
+                    println!("  {GREEN}{}{R}  {} -> {}", u.name, u.from, u.to.version);
+                }
+            }
+            Err(e) => {
+                println!("{RED}[spk] {e}{R}");
+                exit(1);
+            }
+        }
+        return;
+    }
+    let auto = read_name_set(&spk_state_path(root, "auto-installed"));
+    let held = read_name_set(&spk_state_path(root, "held"));
+    let mut names = list_installed_names(root);
+    if has_flag(args, "--auto", "") {
+        names.retain(|n| auto.contains(n));
+    }
+    if has_flag(args, "--manual", "") {
+        names.retain(|n| !auto.contains(n));
+    }
+    if has_flag(args, "--held", "") {
+        names.retain(|n| held.contains(n));
+    }
+    if names.is_empty() {
+        println!(
+            "{YELLOW}[spk] No packages installed (or {} doesn't exist yet).{R}",
+            installed_db_dir(root)
+        );
+        return;
+    }
+    println!("{BOLD}Installed packages ({}){R}", names.len());
+    for name in &names {
+        if let Some(p) = read_installed(root, name) {
+            let mut badge = String::new();
+            if is_nix_package(&p.name) {
+                badge.push_str(&format!(" {YELLOW}[nix]{R}"));
+            }
+            if auto.contains(name) {
+                badge.push_str(&format!(" {CYAN}[auto]{R}"));
+            }
+            if held.contains(name) {
+                badge.push_str(&format!(" {YELLOW}[held]{R}"));
+            }
+            println!("  {GREEN}{}{R}  {}{badge}", p.name, p.version);
+        }
+    }
+}
+
+/// Files the old version owned that the new version no longer ships, and that
+/// no other package owns, are deleted after an upgrade -- what APT and DNF do.
+fn prune_dropped_files(root: &str, name: &str, old_files: &[String]) -> usize {
+    let new_files: std::collections::HashSet<String> = read_installed(root, name)
+        .map(|p| p.files.into_iter().collect())
+        .unwrap_or_default();
+    let mut owned_elsewhere: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for r in all_records(root) {
+        if r.name != name {
+            owned_elsewhere.extend(r.files);
+        }
+    }
+    let mut n = 0;
+    for f in old_files {
+        if !new_files.contains(f) && !owned_elsewhere.contains(f) {
+            remove_root_file(&format!("{}/{}", root.trim_end_matches('/'), f));
+            n += 1;
+        }
+    }
+    n
+}
+
+fn cmd_upgrade(args: &[String]) {
+    let root = target_root();
+    let yes = has_flag(args, "--yes", "-y");
+    let dry = has_flag(args, "--dry-run", "-n");
+    let wanted = names_in(args);
+    let held = read_name_set(&spk_state_path(root, "held"));
+    let ups = match find_upgrades(root) {
+        Ok(u) => u,
+        Err(e) => {
+            println!("{RED}[spk] Cannot check for upgrades: {e}{R}");
+            exit(1);
+        }
+    };
+    for w in &wanted {
+        if !is_installed(root, w) {
+            println!("{RED}[spk] '{w}' is not installed.{R}");
+            exit(1);
+        }
+    }
+    let todo: Vec<&Upgrade> = ups
+        .iter()
+        .filter(|u| if wanted.is_empty() { !held.contains(&u.name) } else { wanted.contains(&u.name) })
+        .collect();
+    if todo.is_empty() {
+        println!("{GREEN}[spk] Nothing to upgrade.{R}");
+        return;
+    }
+    println!("{BOLD}[spk] {} package(s) will be upgraded:{R}", todo.len());
+    for u in &todo {
+        println!("  {GREEN}{}{R}  {} -> {}", u.name, u.from, u.to.version);
+    }
+    if dry {
+        return;
+    }
+    if !yes && !confirm("Proceed?") {
+        println!("{YELLOW}[spk] Aborted -- nothing upgraded.{R}");
+        exit(0);
+    }
+    let mut failures = Vec::new();
+    for u in &todo {
+        let old_files = read_installed(root, &u.name).map(|p| p.files).unwrap_or_default();
+        PLANNED.with(|m| {
+            let mut m = m.borrow_mut();
+            m.clear();
+            m.insert(u.name.clone(), (u.to.repo.clone(), u.to.version.clone()));
+        });
+        println!("{BOLD}[spk] Upgrading {} {} -> {}{R}", u.name, u.from, u.to.version);
+        if fetch_and_install_inner(&u.name, root, &mut Vec::new()) {
+            let dropped = prune_dropped_files(root, &u.name, &old_files);
+            if dropped > 0 {
+                println!("  removed {dropped} file(s) the new version no longer ships.");
+            }
+            log_history(root, "upgrade", &format!("{} {} -> {}", u.name, u.from, u.to.version));
+        } else {
+            failures.push(u.name.clone());
+        }
+    }
+    if failures.is_empty() {
+        println!("{GREEN}{BOLD}[spk] Upgrade complete.{R}");
+    } else {
+        println!("{RED}{BOLD}[spk] Upgrade finished with failures: {}{R}", failures.join(", "));
+        exit(1);
+    }
+}
+
+fn cmd_reinstall(names: &[String]) {
+    let root = target_root();
+    if names.is_empty() {
+        println!("{RED}[spk] Error: specify a package.   spk reinstall <pkg>{R}");
+        exit(1);
+    }
+    for n in names {
+        if !is_installed(root, n) {
+            println!("{RED}[spk] '{n}' is not installed; use 'spk install {n}'.{R}");
+            exit(1);
+        }
+        let old_files = read_installed(root, n).map(|p| p.files).unwrap_or_default();
+        if !fetch_and_install_inner(n, root, &mut Vec::new()) {
+            println!("{RED}{BOLD}[spk] Reinstall failed for {n}.{R}");
+            exit(1);
+        }
+        prune_dropped_files(root, n, &old_files);
+        log_history(root, "reinstall", n);
+        println!("{GREEN}[spk] {n} reinstalled.{R}");
+    }
+}
+
+/// Everything reachable from the explicitly installed packages through
+/// `depends` (every alternative that is installed counts as needed).
+fn needed_set(recs: &[InstalledPkg], auto: &BTreeSet<String>) -> std::collections::HashSet<String> {
+    let pkgs: Vec<resolver::Pkg> = recs
+        .iter()
+        .map(|p| resolver::Pkg::new(&p.name, &p.version, &p.depends, &p.provides, &p.conflicts))
+        .collect();
+    let mut needed: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut stack: Vec<String> = recs.iter().filter(|r| !auto.contains(&r.name)).map(|r| r.name.clone()).collect();
+    while let Some(n) = stack.pop() {
+        if !needed.insert(n.clone()) {
+            continue;
+        }
+        let Some(p) = pkgs.iter().find(|p| p.name == n) else { continue };
+        for group in &p.depends {
+            for alt in group {
+                for q in pkgs.iter().filter(|q| q.satisfies(alt)) {
+                    stack.push(q.name.clone());
+                }
+            }
+        }
+    }
+    needed
+}
+
+fn cmd_autoremove(args: &[String]) {
+    let root = target_root();
+    let yes = has_flag(args, "--yes", "-y");
+    let dry = has_flag(args, "--dry-run", "-n");
+    let auto = read_name_set(&spk_state_path(root, "auto-installed"));
+    let recs = all_records(root);
+    let needed = needed_set(&recs, &auto);
+    let removable: Vec<String> = recs
+        .iter()
+        .filter(|r| auto.contains(&r.name) && !needed.contains(&r.name))
+        .map(|r| r.name.clone())
+        .collect();
+    if removable.is_empty() {
+        println!("{GREEN}[spk] Nothing to remove: no dependency is left without a package needing it.{R}");
+        return;
+    }
+    println!("{BOLD}[spk] {} package(s) are no longer needed:{R}", removable.len());
+    for n in &removable {
+        println!("  {GREEN}{n}{R}");
+    }
+    if dry {
+        return;
+    }
+    if !yes && !confirm("Remove them?") {
+        println!("{YELLOW}[spk] Aborted -- nothing removed.{R}");
+        exit(0);
+    }
+    let exe = env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("spk"));
+    for n in &removable {
+        let ok = Command::new(&exe)
+            .args(["remove", n, "-y", "--force"])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !ok {
+            println!("{RED}{BOLD}[spk] Could not remove {n}; stopping.{R}");
+            exit(1);
+        }
+        set_auto_mark(root, n, false);
+    }
+    log_history(root, "autoremove", &removable.join(" "));
+    println!("{GREEN}{BOLD}[spk] Autoremove complete.{R}");
+}
+
+/// `mark-manual`, `mark-auto`, `hold`, `unhold` (APT's apt-mark).
+fn cmd_mark(action: &str, names: &[String]) {
+    let root = target_root();
+    if names.is_empty() {
+        println!("{RED}[spk] Error: specify a package.   spk {action} <pkg>...{R}");
+        exit(1);
+    }
+    for n in names {
+        if !is_installed(root, n) {
+            println!("{RED}[spk] '{n}' is not installed.{R}");
+            exit(1);
+        }
+        match action {
+            "mark-manual" => set_auto_mark(root, n, false),
+            "mark-auto" => set_auto_mark(root, n, true),
+            _ => {
+                let path = spk_state_path(root, "held");
+                let mut set = read_name_set(&path);
+                if action == "hold" {
+                    set.insert(n.clone());
+                } else {
+                    set.remove(n);
+                }
+                write_name_set(&path, &set);
+            }
+        }
+        println!("{GREEN}[spk] {n}: {action} done.{R}");
+    }
+}
+
+/// `spk verify [pkg...]`: every file a package's record lists must still be
+/// on disk. Records hold no checksums yet, so this finds missing files, not
+/// modified ones.
+fn cmd_verify(args: &[String]) {
+    let root = target_root();
+    let wanted = names_in(args);
+    let verbose = has_flag(args, "--verbose", "-v");
+    let names = if wanted.is_empty() { list_installed_names(root) } else { wanted };
+    let mut bad = 0;
+    for n in &names {
+        let Some(r) = read_installed(root, n) else {
+            println!("{RED}[spk] '{n}' is not installed.{R}");
+            exit(1);
+        };
+        let missing: Vec<&String> = r
+            .files
+            .iter()
+            .filter(|f| fs::symlink_metadata(format!("{}/{}", root.trim_end_matches('/'), f)).is_err())
+            .collect();
+        if !missing.is_empty() {
+            bad += 1;
+            println!("{YELLOW}{n}{R}: {} of {} file(s) missing", missing.len(), r.files.len());
+            for f in missing.iter().take(if verbose { usize::MAX } else { 3 }) {
+                println!("    /{f}");
+            }
+        }
+    }
+    if bad == 0 {
+        println!("{GREEN}[spk] All files of {} package(s) are present.{R}", names.len());
+    } else {
+        println!("{YELLOW}[spk] {bad} package(s) have missing files. (-v lists them all){R}");
+        exit(1);
+    }
+}
+
+/// `spk check`: every installed package's dependencies are satisfied and no
+/// installed pair conflicts.
+fn cmd_check() {
+    let root = target_root();
+    let recs = all_records(root);
+    let pkgs: Vec<resolver::Pkg> = recs
+        .iter()
+        .map(|p| resolver::Pkg::new(&p.name, &p.version, &p.depends, &p.provides, &p.conflicts))
+        .collect();
+    let mut problems = 0;
+    for p in &pkgs {
+        for group in &p.depends {
+            if !group.iter().any(|alt| pkgs.iter().any(|q| q.satisfies(alt))) {
+                problems += 1;
+                println!("{YELLOW}{}{R}: unmet dependency: {}", p.name, dep_groups_to_string(std::slice::from_ref(group)));
+            }
+        }
+        for c in &p.conflicts {
+            if let Some(q) = pkgs.iter().find(|q| q.name != p.name && q.satisfies(c)) {
+                problems += 1;
+                println!("{RED}{}{R}: conflicts with installed {}", p.name, q.name);
+            }
+        }
+    }
+    if problems == 0 {
+        println!("{GREEN}[spk] No broken dependencies among {} package(s).{R}", pkgs.len());
+    } else {
+        println!("{YELLOW}[spk] {problems} problem(s) found.{R}");
+        exit(1);
+    }
+}
+
+fn cmd_history() {
+    match fs::read_to_string(spk_state_path(target_root(), "history.log")) {
+        Ok(t) if !t.trim().is_empty() => print!("{t}"),
+        _ => println!("{YELLOW}[spk] No history yet.{R}"),
+    }
+}
+
+/// Download packages into the current directory without installing them.
+fn cmd_download(names: &[String]) {
+    if names.is_empty() {
+        println!("{RED}[spk] Error: specify a package.   spk download <pkg>...{R}");
+        exit(1);
+    }
+    for n in names {
+        let dest = format!("{n}.spkg");
+        if fetch_package_ext(n, "spkg", &dest) {
+            println!("{GREEN}[spk] Saved {dest}{R}");
+        } else {
+            println!("{RED}[spk] Could not download {n}.{R}");
+            exit(1);
+        }
+    }
+}
+
+/// Remove the partial downloads an interrupted install can leave in /tmp.
+fn cmd_clean() {
+    let mut n = 0;
+    if let Ok(entries) = fs::read_dir("/tmp") {
+        for e in entries.flatten() {
+            let name = e.file_name().to_string_lossy().into_owned();
+            if name.starts_with("spk-") && (name.ends_with(".spkg") || name.ends_with(".tar.xz")) {
+                if fs::remove_file(e.path()).is_ok() {
+                    n += 1;
+                }
+            }
+        }
+    }
+    println!("{GREEN}[spk] Removed {n} leftover download(s).{R}");
+}
+
+fn write_repo_conf(repos: &[Repo]) -> bool {
+    let path = env::var("SPK_REPO_CONF").unwrap_or_else(|_| REPO_CONF_PATH.to_string());
+    write_root_file(&path, &repos_to_yaml(repos))
+}
+
+/// `spk repo list|add|remove`. Rewrites the config file from the parsed repos,
+/// so hand-written comments in it are not kept.
+fn cmd_repo(args: &[String]) {
+    let sub = args.first().map(|s| s.as_str()).unwrap_or("list");
+    let rest = if args.is_empty() { &[][..] } else { &args[1..] };
+    match sub {
+        "list" => cmd_repo_status(),
+        "add" => {
+            let pos = names_in(&rest.iter().filter(|a| !a.starts_with("--")).cloned().collect::<Vec<_>>());
+            let flag_val = |flag: &str| rest.iter().position(|a| a == flag).and_then(|i| rest.get(i + 1)).cloned();
+            let value_args: Vec<String> = ["--priority", "--key"].iter().filter_map(|f| flag_val(f)).collect();
+            let pos: Vec<String> = pos.into_iter().filter(|p| !value_args.contains(p)).collect();
+            if pos.len() != 2 {
+                println!("{RED}[spk] Error: spk repo add <name> <url> [--priority N] [--key /path/key.pub]{R}");
+                exit(1);
+            }
+            let priority = flag_val("--priority").and_then(|p| p.parse::<u8>().ok()).unwrap_or(50);
+            let mut repos = load_repos();
+            if repos.iter().any(|r| r.name == pos[0]) {
+                println!("{RED}[spk] A repo called '{}' already exists.{R}", pos[0]);
+                exit(1);
+            }
+            let mut repo = Repo::unsigned(&pos[0], &pos[1], priority);
+            if let Some(path) = flag_val("--key") {
+                repo.key = match fs::read_to_string(&path) {
+                    Ok(pem) if pem.contains("BEGIN PUBLIC KEY") => Ok(Some(pem)),
+                    Ok(_) => Err(format!("key file {path} is not a PEM public key")),
+                    Err(e) => Err(format!("cannot read key file {path}: {e}")),
+                };
+                if let Err(e) = &repo.key {
+                    println!("{RED}[spk] {e}{R}");
+                    exit(1);
+                }
+                repo.key_path = Some(path);
+            }
+            repos.push(repo);
+            repos.sort_by_key(|r| r.priority);
+            if !write_repo_conf(&repos) {
+                println!("{RED}[spk] Failed to write the repo config.{R}");
+                exit(1);
+            }
+            println!("{GREEN}[spk] Repo '{}' added (priority {priority}).{R}", pos[0]);
+        }
+        "remove" => {
+            let Some(name) = names_in(rest).into_iter().next() else {
+                println!("{RED}[spk] Error: spk repo remove <name>{R}");
+                exit(1);
+            };
+            let mut repos = load_repos();
+            let before = repos.len();
+            repos.retain(|r| r.name != name);
+            if repos.len() == before {
+                println!("{RED}[spk] No repo called '{name}'.{R}");
+                exit(1);
+            }
+            if repos.is_empty() {
+                println!("{RED}[spk] Refusing to remove the last repo.{R}");
+                exit(1);
+            }
+            if !write_repo_conf(&repos) {
+                println!("{RED}[spk] Failed to write the repo config.{R}");
+                exit(1);
+            }
+            println!("{GREEN}[spk] Repo '{name}' removed.{R}");
+        }
+        other => {
+            println!("{RED}[spk] Unknown repo command '{other}'. Use: list, add, remove.{R}");
+            exit(1);
+        }
+    }
+}
+
 // ── create-live-image ──────────────────────────────────────────────────────────
 //
 // Assembles a bootable image straight from packages already sitting on a
@@ -2153,14 +3492,38 @@ fn cmd_system_upgrade() {
 
 fn fetch_repo_index() -> Option<(String, Vec<String>)> {
     for repo in load_repos() {
+        match trust_of(&repo) {
+            Ok(Trust::Signed(_)) => {
+                // Names come from the verified index.meta, never from an unsigned index.txt.
+                match verified_index(&repo) {
+                    Ok(vi) => {
+                        let mut names: Vec<String> = vi.latest.keys().cloned().collect();
+                        names.sort();
+                        if !names.is_empty() {
+                            return Some((repo.name.clone(), names));
+                        }
+                    }
+                    Err(IndexError::Unreachable(_)) => {}
+                    Err(IndexError::Untrusted(m)) => {
+                        println!("{RED}{BOLD}[spk] Repo '{}' failed verification: {m}{R}", repo.name);
+                        return None;
+                    }
+                }
+                continue;
+            }
+            Err(TrustError::Disallowed(m)) => {
+                println!("{YELLOW}[spk] Skipping: {m}{R}");
+                continue;
+            }
+            Err(TrustError::Broken(m)) => {
+                println!("{RED}{BOLD}[spk] Repo '{}' is misconfigured: {m}{R}", repo.name);
+                return None;
+            }
+            Ok(Trust::Unsigned) => {}
+        }
         let idx_tmp = format!("/tmp/spk-index-{}.txt", std::process::id());
         let url = format!("{}/index.txt", repo.url.trim_end_matches('/'));
-        let ok = Command::new("curl")
-            .args(["-sfL", "-o", &idx_tmp, &url])
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
-        if !ok {
+        if !curl_to(&url, &idx_tmp) {
             let _ = fs::remove_file(&idx_tmp);
             continue;
         }
@@ -2661,23 +4024,32 @@ fn main() {
                 return;
             }
 
-            if rest.is_empty() {
-                println!("{RED}[spk] Error: specify a package.   spk install <pkg>{R}");
+            let names = names_in(rest);
+            if names.is_empty() {
+                println!("{RED}[spk] Error: specify a package.   spk install <pkg>...{R}");
                 exit(1);
             }
-            let pkg = &rest[0];
             // A bare argument that looks like a filesystem path is a
             // mistake worth catching explicitly, not silently guessing at
             // -- "spk install <name>" only ever means "fetch from a
             // configured repo".
-            if looks_like_local_path(pkg) {
-                println!("{RED}[spk] '{pkg}' looks like a local file, not a repo package name.{R}");
-                println!("  'spk install <name>' only fetches from configured repos.");
-                println!("  To install a local .spkg file, use:");
-                println!("    {BOLD}spk install --local-package {pkg}{R}");
-                exit(1);
+            for pkg in &names {
+                if looks_like_local_path(pkg) {
+                    println!("{RED}[spk] '{pkg}' looks like a local file, not a repo package name.{R}");
+                    println!("  'spk install <name>' only fetches from configured repos.");
+                    println!("  To install a local .spkg file, use:");
+                    println!("    {BOLD}spk install --local-package {pkg}{R}");
+                    exit(1);
+                }
             }
-            cmd_install(pkg);
+            let dry = has_flag(rest, "--dry-run", "-n");
+            for pkg in &names {
+                if dry {
+                    cmd_solve(pkg, false);
+                } else {
+                    cmd_install(pkg);
+                }
+            }
         }
 
         "local-package-repo" => {
@@ -2690,7 +4062,7 @@ fn main() {
             cmd_local_package_repo(&args[2]);
         }
 
-        "remove" | "uninstall" => {
+        "remove" | "uninstall" | "purge" => {
             let rest = &args[2..];
             let force = rest.iter().any(|a| a == "--force");
             let yes = rest.iter().any(|a| a == "-y" || a == "--yes");
@@ -2703,7 +4075,48 @@ fn main() {
             }
         }
 
-        "list" => cmd_list(),
+        "list" => cmd_list(&args[2..]),
+
+        "update" | "refresh" => cmd_update(),
+        "search" => cmd_search(&args[2..]),
+        "info" | "show" => match names_in(&args[2..]).first() {
+            Some(n) => cmd_info(n),
+            None => {
+                println!("{RED}[spk] Error: specify a package.   spk info <pkg>{R}");
+                exit(1);
+            }
+        },
+        "files" => match args.get(2) {
+            Some(n) => cmd_files(n),
+            None => {
+                println!("{RED}[spk] Error: specify a package.   spk files <pkg>{R}");
+                exit(1);
+            }
+        },
+        "owns" | "which" => match args.get(2) {
+            Some(path) => cmd_owns(path),
+            None => {
+                println!("{RED}[spk] Error: specify a path.   spk owns /usr/bin/foo{R}");
+                exit(1);
+            }
+        },
+        "provides" => match args.get(2) {
+            Some(n) => cmd_provides(n),
+            None => {
+                println!("{RED}[spk] Error: specify a name.   spk provides <name>{R}");
+                exit(1);
+            }
+        },
+        "upgrade" | "full-upgrade" | "dist-upgrade" => cmd_upgrade(&args[2..]),
+        "reinstall" => cmd_reinstall(&names_in(&args[2..])),
+        "autoremove" => cmd_autoremove(&args[2..]),
+        "mark-manual" | "mark-auto" | "hold" | "unhold" => cmd_mark(args[1].as_str(), &names_in(&args[2..])),
+        "verify" => cmd_verify(&args[2..]),
+        "check" => cmd_check(),
+        "history" => cmd_history(),
+        "download" => cmd_download(&names_in(&args[2..])),
+        "clean" | "autoclean" => cmd_clean(),
+        "repo" => cmd_repo(&args[2..]),
 
         "depends" => {
             if args.len() < 3 {
@@ -2712,6 +4125,8 @@ fn main() {
             }
             cmd_depends(&args[2]);
         }
+
+        "repo-status" => cmd_repo_status(),
 
         "solve" => {
             let porcelain = args.iter().skip(2).any(|a| a == "--porcelain");
@@ -2969,4 +4384,223 @@ repos:
         assert!(!is_apt_package("hello~nix~"));
         assert!(!is_apt_package("hello"));
     }
+
+    // ── Repository trust ──────────────────────────────────────────────────────
+    mod trust_tests {
+        use super::*;
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        static N: AtomicU64 = AtomicU64::new(0);
+
+        fn tmp(tag: &str) -> std::path::PathBuf {
+            let d = std::env::temp_dir().join(format!(
+                "spk-trust-{tag}-{}-{}",
+                std::process::id(),
+                N.fetch_add(1, Ordering::SeqCst)
+            ));
+            let _ = fs::remove_dir_all(&d);
+            fs::create_dir_all(&d).unwrap();
+            d
+        }
+
+        fn run(args: &[&str]) {
+            let st = Command::new("openssl").args(args).status().unwrap();
+            assert!(st.success(), "openssl {args:?}");
+        }
+
+        /// (private key path, public PEM)
+        fn keypair(dir: &Path) -> (String, String) {
+            let k = dir.join("k.pem");
+            let kp = dir.join("k.pub");
+            run(&["genpkey", "-algorithm", "ed25519", "-out", k.to_str().unwrap()]);
+            run(&["pkey", "-in", k.to_str().unwrap(), "-pubout", "-out", kp.to_str().unwrap()]);
+            (k.to_str().unwrap().to_string(), fs::read_to_string(kp).unwrap())
+        }
+
+        fn sign(dir: &Path, key: &str, meta: &[u8]) -> String {
+            let hash = sha256_hex_of_bytes(meta).unwrap();
+            let msg = dir.join("m");
+            let sigf = dir.join("s");
+            fs::write(&msg, index_signing_message("index.meta", &hash)).unwrap();
+            run(&["pkeyutl", "-sign", "-rawin", "-inkey", key, "-in", msg.to_str().unwrap(), "-out", sigf.to_str().unwrap()]);
+            let out = Command::new("openssl").args(["base64", "-A", "-in", sigf.to_str().unwrap()]).output().unwrap();
+            String::from_utf8(out.stdout).unwrap()
+        }
+
+        fn repo(name: &str, max_age: u64) -> Repo {
+            let mut r = Repo::unsigned(name, "https://example.org/repo", 1);
+            r.max_index_age_days = max_age;
+            r
+        }
+
+        fn meta_at(generated: u64) -> String {
+            format!(
+                "format: 1\ngenerated: {generated}\n\nname: a\nversion: 1.0-9\nsha256: {}\n\n\
+                 name: a\nversion: 1.0-10\nsha256: {}\n\nname: b\nversion: 2\nsha256: {}\n",
+                "11".repeat(32), "22".repeat(32), "33".repeat(32)
+            )
+        }
+
+        const NOW: u64 = 1_800_000_000;
+
+        #[test]
+        fn accepts_a_valid_index_and_pins_by_version() {
+            let d = tmp("ok");
+            let (key, pem) = keypair(&d);
+            let meta = meta_at(NOW - 3600);
+            let sig = sign(&d, &key, meta.as_bytes());
+            let vi = check_signed_index(&repo("r", 14), &pem, meta.as_bytes(), &sig, NOW, &d).unwrap();
+            assert!(vi.signed);
+            assert_eq!(vi.generated, Some(NOW - 3600));
+            assert_eq!(vi.pins[&("a".to_string(), "1.0-10".to_string())], "22".repeat(32));
+            // dpkg ordering, not string ordering: 1.0-10 is newer than 1.0-9
+            assert_eq!(vi.latest["a"], "1.0-10");
+            assert_eq!(vi.latest["b"], "2");
+        }
+
+        #[test]
+        fn rejects_a_tampered_index() {
+            let d = tmp("tamper");
+            let (key, pem) = keypair(&d);
+            let meta = meta_at(NOW);
+            let sig = sign(&d, &key, meta.as_bytes());
+            let evil = meta.replace("version: 2", "version: 3");
+            match check_signed_index(&repo("r", 14), &pem, evil.as_bytes(), &sig, NOW, &d) {
+                Err(IndexError::Untrusted(m)) => assert!(m.contains("signature is invalid"), "{m}"),
+                other => panic!("expected rejection, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn rejects_wrong_key_and_garbage_signatures() {
+            let d = tmp("key");
+            let (key, _pem) = keypair(&d);
+            let d2 = tmp("key2");
+            let (_k2, other_pem) = keypair(&d2);
+            let meta = meta_at(NOW);
+            let sig = sign(&d, &key, meta.as_bytes());
+            for (pem, s) in [(&other_pem, sig.as_str()), (&other_pem, "not base64 !!"), (&other_pem, "")] {
+                assert!(matches!(
+                    check_signed_index(&repo("r", 14), pem, meta.as_bytes(), s, NOW, &d),
+                    Err(IndexError::Untrusted(_))
+                ));
+            }
+        }
+
+        #[test]
+        fn rejects_stale_and_future_indexes() {
+            let d = tmp("age");
+            let (key, pem) = keypair(&d);
+            let stale = meta_at(NOW - 15 * 86_400);
+            let sig = sign(&d, &key, stale.as_bytes());
+            match check_signed_index(&repo("r", 14), &pem, stale.as_bytes(), &sig, NOW, &d) {
+                Err(IndexError::Untrusted(m)) => assert!(m.contains("stale"), "{m}"),
+                other => panic!("{other:?}"),
+            }
+            // the same index is fine under a longer limit
+            assert!(check_signed_index(&repo("r2", 30), &pem, stale.as_bytes(), &sig, NOW, &tmp("age2")).is_ok());
+            let future = meta_at(NOW + 3 * 86_400);
+            let sig = sign(&d, &key, future.as_bytes());
+            match check_signed_index(&repo("r3", 14), &pem, future.as_bytes(), &sig, NOW, &tmp("age3")) {
+                Err(IndexError::Untrusted(m)) => assert!(m.contains("future"), "{m}"),
+                other => panic!("{other:?}"),
+            }
+        }
+
+        #[test]
+        fn rejects_rollback_to_an_older_signed_index() {
+            let d = tmp("rb");
+            let state = tmp("rb-state");
+            let (key, pem) = keypair(&d);
+            let newer = meta_at(NOW - 100);
+            let older = meta_at(NOW - 5_000);
+            let sig_new = sign(&d, &key, newer.as_bytes());
+            let sig_old = sign(&d, &key, older.as_bytes());
+            let r = repo("r", 14);
+            check_signed_index(&r, &pem, newer.as_bytes(), &sig_new, NOW, &state).unwrap();
+            match check_signed_index(&r, &pem, older.as_bytes(), &sig_old, NOW, &state) {
+                Err(IndexError::Untrusted(m)) => assert!(m.contains("rollback"), "{m}"),
+                other => panic!("{other:?}"),
+            }
+            // the same generation again and a newer one are fine
+            check_signed_index(&r, &pem, newer.as_bytes(), &sig_new, NOW, &state).unwrap();
+            let newest = meta_at(NOW - 10);
+            let sig_newest = sign(&d, &key, newest.as_bytes());
+            check_signed_index(&r, &pem, newest.as_bytes(), &sig_newest, NOW, &state).unwrap();
+        }
+
+        #[test]
+        fn a_signed_index_without_a_timestamp_is_refused() {
+            let d = tmp("nots");
+            let (key, pem) = keypair(&d);
+            let meta = "name: a\nversion: 1\nsha256: aa\n".to_string();
+            let sig = sign(&d, &key, meta.as_bytes());
+            match check_signed_index(&repo("r", 14), &pem, meta.as_bytes(), &sig, NOW, &d) {
+                Err(IndexError::Untrusted(m)) => assert!(m.contains("generated"), "{m}"),
+                other => panic!("{other:?}"),
+            }
+        }
+
+        #[test]
+        fn python_signed_fixture_verifies_in_rust() {
+            // Produced by smechbuild's signing.py: the two implementations must agree on the message format.
+            let pem = "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAcmhlA+WYL/5PMn3BguGV9NrySMxkxoPWD5jaKAiG2bI=\n-----END PUBLIC KEY-----\n";
+            let meta = "format: 1\ngenerated: 1792935770\n\nname: libx\nversion: 1.0-1\nsha256: abababababababababababababababababababababababababababababababab\n\nname: libx\nversion: 1.0-10\nsha256: cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd\n";
+            let sig = "TssiUEjdS+J7RxRD4+9/5at30bS1CN9huD/5eC9sbOht7rcCnt/PNyO5bK15Pm60kP00IGJzfDAgbzle3JtBDg==";
+            let d = tmp("xlang");
+            let vi = check_signed_index(&repo("r", 14), pem, meta.as_bytes(), sig, 1_792_935_770 + 60, &d).unwrap();
+            assert_eq!(vi.latest["libx"], "1.0-10");
+            assert_eq!(vi.pins[&("libx".to_string(), "1.0-1".to_string())], "ab".repeat(32));
+            let tampered = meta.replace("1.0-10", "1.0-11");
+            assert!(check_signed_index(&repo("r", 14), pem, tampered.as_bytes(), sig, 1_792_935_770 + 60, &tmp("xlang2")).is_err());
+        }
+
+        #[test]
+        fn trust_policy() {
+            let mut r = Repo::unsigned("r", "https://example.org/x", 1);
+            assert!(matches!(trust_of(&r), Ok(Trust::Unsigned)));
+            r.require_signed = true;
+            assert!(matches!(trust_of(&r), Err(TrustError::Disallowed(_))));
+            r.url = "file:///srv/local".to_string();
+            assert!(matches!(trust_of(&r), Ok(Trust::Unsigned)), "file:// repos are the operator's own");
+            r.key = Ok(Some("PEM".into()));
+            assert!(matches!(trust_of(&r), Ok(Trust::Signed(_))));
+            r.key = Err("cannot read key".into());
+            assert!(matches!(trust_of(&r), Err(TrustError::Broken(_))), "a broken key must not degrade to unsigned");
+        }
+
+        #[test]
+        fn config_parses_signing_settings_and_round_trips() {
+            let d = tmp("conf");
+            let (_k, pem) = keypair(&d);
+            let keyfile = d.join("archive.pub");
+            fs::write(&keyfile, &pem).unwrap();
+            let conf = format!(
+                "require_signed: true\nrepos:\n  - name: smech\n    url: https://a.example/repo\n    priority: 1\n    key: {}\n    max_index_age_days: 3\n  - name: bad\n    url: https://b.example\n    key: /nonexistent/key.pub\n  - name: plain\n    url: https://c.example\n",
+                keyfile.display()
+            );
+            let repos = parse_repo_conf(&conf);
+            assert_eq!(repos.len(), 3);
+            assert!(matches!(trust_of(&repos[0]), Ok(Trust::Signed(p)) if p == pem));
+            assert_eq!(repos[0].max_index_age_days, 3);
+            assert!(repos.iter().all(|r| r.require_signed), "top-level require_signed applies to every entry");
+            assert!(matches!(trust_of(&repos[1]), Err(TrustError::Broken(_))));
+            assert!(matches!(trust_of(&repos[2]), Err(TrustError::Disallowed(_))));
+            // rewriting the config keeps key, require_signed and the age limit
+            let again = parse_repo_conf(&repos_to_yaml(&repos));
+            assert_eq!(again[0].key_path.as_deref(), Some(keyfile.to_str().unwrap()));
+            assert_eq!(again[0].max_index_age_days, 3);
+            assert!(again[2].require_signed);
+        }
+
+        #[test]
+        fn non_pem_key_file_is_rejected() {
+            let d = tmp("badkey");
+            let f = d.join("k.pub");
+            fs::write(&f, "ssh-ed25519 AAAA... not a pem").unwrap();
+            let repos = parse_repo_conf(&format!("repos:\n  - name: r\n    url: https://x\n    key: {}\n", f.display()));
+            assert!(matches!(trust_of(&repos[0]), Err(TrustError::Broken(_))));
+        }
+    }
+
 }
